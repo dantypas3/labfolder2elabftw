@@ -3,7 +3,7 @@ import mimetypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from elabftw_client.utils.endpoints import get_fixed
+from utils import get_fixed
 
 
 class Importer:

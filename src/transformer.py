@@ -11,8 +11,31 @@ import numpy as np
 import pandas as pd
 import xlsxwriter
 
-from src.labfolder_migration.fetcher import LabFolderFetcher
-from src.labfolder_migration.importer import Importer
+from src.fetcher import LabFolderFetcher
+from src.importer import Importer
+
+
+# — set up a logs directory alongside your project root —
+ROOT_DIR = Path(__file__).resolve().parent.parent
+LOG_DIR  = ROOT_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# — configure a file handler for transformer logs —
+TRANS_LOG_FILE = LOG_DIR / "transformer.log"
+file_handler = logging.FileHandler(str(TRANS_LOG_FILE), mode="a")
+file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+))
+
+# — get the Transformer logger and attach the handler —
+transformer_logger = logging.getLogger("Transformer")
+transformer_logger.setLevel(logging.INFO)
+transformer_logger.addHandler(file_handler)
+
+# (Optionally also echo to console:)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+transformer_logger.addHandler(console_handler)
 
 
 class Transformer:
@@ -72,13 +95,17 @@ class Transformer:
         title = project[0].get("project_title", "")
         tags: List[str] = []
         for entry in project:
-            tags.extend(entry.get("tags", np.array([])).tolist())
+            tags.extend(entry.get("tags", np.array([])))
         return title, tags
 
     def build_entry_html (self, entry: Dict[str, Any], exp_id: str) -> str:
+        entry_tags = entry.get("tags", [])
+        formatted_tags = " ". join(f"§{tag}" for tag in entry_tags)
         header = (
             f"\n----Entry {entry['entry_number']} of {entry['number_of_entries']}----<br>"
-            f"<strong>Entry: {entry['entry_title']} (labfolder id: {entry['entry_id']})</strong><br>")
+            f"<strong>Entry: {entry['entry_title']} (labfolder id: {entry['entry_id']})</strong><br>"
+            f"<strong>Tags:</strong> {formatted_tags}</strong><br>"
+            )
         blocks: List[str] = []
 
         for element in entry.get("elements", []):
@@ -193,93 +220,100 @@ class Transformer:
         Tuple[str, Path]]:
         excel_files: List[Tuple[str, Path]] = []
         content = metadata.get("content")
-        if not isinstance(content, dict):
+        if not content or not isinstance(content, dict):
             return excel_files
 
-        tmp_dir = Path(tempfile.gettempdir())
-        for sheet_name, sheet in content.get("sheets", {}).items():
+        # use content['sheets'] or fallback to a top-level metadata['sheets']
+        sheets = content.get('sheets') or metadata.get('sheets') or {}
+        for sheet_name, sheet in sheets.items():
+            # If sheet is a dict (SpreadJS), reconstruct a DataFrame from the sparse dataTable
+            if isinstance(sheet, dict):
+                row_count = sheet.get('rowCount') or 0
+                col_count = sheet.get('columnCount') or 0
+                data_table = {}
+                if isinstance(sheet.get('data'), dict):
+                    data_table = sheet.get('data', {}).get('dataTable',
+                                                           {}) or {}
+                rows = []
+                for i in range(int(row_count)):
+                    row_table = data_table.get(str(i), {}) or {}
+                    row_data = []
+                    for j in range(int(col_count)):
+                        cell = row_table.get(str(j), {}) or {}
+                        value = cell.get('value') if isinstance(cell,
+                                                                dict) else cell
+                        if isinstance(value, (dict, list)):
+                            value = json.dumps(value)
+                        row_data.append(value)
+                    rows.append(row_data)
+                df = pd.DataFrame(rows)
+            # If sheet is a string, treat it as a CSV
+            elif isinstance(sheet, str):
+                from csv import Sniffer
+                from io import StringIO
+                text = sheet.strip()
+                delimiter = ','
+                try:
+                    delimiter = Sniffer().sniff(text.splitlines()[0]).delimiter
+                except Exception:
+                    pass
+                df = pd.read_csv(StringIO(text), sep=delimiter, header=None)
+            else:
+                self.logger.warning("Skipping sheet %s: unsupported type %r",
+                                    sheet_name, type(sheet))
+                continue
 
+            # Write DataFrame to a deterministic Excel file in /tmp
+            tmp_dir = Path(tempfile.gettempdir())
             xlsx_path = tmp_dir / f"{sheet_name}.xlsx"
             if xlsx_path.exists():
                 xlsx_path.unlink()
-
-            wb = xlsxwriter.Workbook(str(xlsx_path))
-            ws = wb.add_worksheet(sheet_name)
-
-            data_table = sheet.get("data", {}).get("dataTable", {})
-            for r in range(int(sheet.get("rowCount") or 0)):
-                row = data_table.get(str(r), {}) or {}
-                for c in range(int(sheet.get("columnCount") or 0)):
-                    raw = row.get(str(c), {})
-
-                    cell = raw if isinstance(raw, dict) else {
-                        "value": raw
-                        }
-
-                    val = cell.get("value")
-                    sty = cell.get("style", {}) or {}
-
-                    fmt_kwargs = {}
-                    m = re.match(r"rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)",
-                                 sty.get("foreColor", ""), )
-                    if m:
-                        r_val, g_val, b_val = map(int, m.groups())
-                        fmt_kwargs[
-                            "font_color"] = f"#{r_val:02x}{g_val:02x}{b_val:02x}"
-
-                    fmt = wb.add_format(fmt_kwargs) if fmt_kwargs else None
-
-                    if val is None:
-                        if fmt:
-                            ws.write_blank(r, c, None, fmt)
-                        else:
-                            ws.write_blank(r, c, None)
-                        continue
-
-                    if isinstance(val, (dict, list)):
-                        val = json.dumps(val)
-
-                    if fmt:
-                        ws.write(r, c, val, fmt)
-                    else:
-                        ws.write(r, c, val)
-
-            wb.close()
+            with pd.ExcelWriter(str(xlsx_path), engine='xlsxwriter') as writer:
+                safe_name = sheet_name[:31] or "sheet1"
+                df.to_excel(writer, sheet_name=safe_name, index=False)
             excel_files.append((sheet_name, xlsx_path))
 
         return excel_files
 
     def _export_well_plate_to_excel (self, metadata: Dict[str, Any]) -> List[
         Tuple[str, Path]]:
+        """
+        Convert a WELL_PLATE element into one or more Excel files.
+
+        If the well plate uses the same SpreadJS structure as a TABLE,
+        this just delegates to _export_table_to_excel.  Otherwise, it
+        assumes the `content` is a plain text table (CSV-like) and writes
+        it to a single sheet.
+        """
+        excel_files: List[Tuple[str, Path]] = []
         content = metadata.get("content")
 
-        if isinstance(content, dict) and content.get("sheets"):
+        # Case 1: SpreadJS-like content (dict with sheets) – reuse table export
+        if isinstance(content, dict) and (
+                content.get("sheets") or metadata.get("sheets")):
             return self._export_table_to_excel(metadata)
 
-        excel_files: List[Tuple[str, Path]] = []
+        # Case 2: CSV-like string
         if isinstance(content, str) and content.strip():
             from csv import Sniffer
             from io import StringIO
 
             text = content.strip()
+            delimiter = ","
             try:
-                sep = Sniffer().sniff(text.splitlines()[0]).delimiter
+                delimiter = Sniffer().sniff(text.splitlines()[0]).delimiter
             except Exception:
-                sep = ","
+                pass
+            df = pd.read_csv(StringIO(text), sep=delimiter, header=None)
 
-            df = pd.read_csv(StringIO(text), sep=sep, header=None)
             tmp_dir = Path(tempfile.gettempdir())
-
             xlsx_path = tmp_dir / "well_plate.xlsx"
             if xlsx_path.exists():
                 xlsx_path.unlink()
 
-            wb = xlsxwriter.Workbook(str(xlsx_path))
-            ws = wb.add_worksheet("well_plate")
-            for r_idx, row in df.iterrows():
-                for c_idx, v in enumerate(row.tolist()):
-                    ws.write(r_idx, c_idx, v)
-            wb.close()
+            with pd.ExcelWriter(str(xlsx_path), engine="xlsxwriter") as writer:
+                df.to_excel(writer, sheet_name="well_plate", index=False)
+
             excel_files.append(("well_plate", xlsx_path))
 
         return excel_files
@@ -288,8 +322,8 @@ class Transformer:
         str, Any]:
         return {
             "Project Owner"        : first_entry.get("project_owner"),
-            "project_creation_date": first_entry.get("project_creation_date"),
-            "Labfolder_ID"         : first_entry.get("Labfolder_ID"),
+            "Project creation date": first_entry.get("project_creation_date"),
+            "Labfolder ID"         : first_entry.get("Labfolder_ID"),
             }
 
     def build_footer_html (self, first_entry: Dict[str, Any]) -> str:

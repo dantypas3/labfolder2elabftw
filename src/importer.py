@@ -3,7 +3,7 @@ import mimetypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from utils import get_fixed
+from .utils import get_fixed
 
 
 class Importer:
@@ -57,7 +57,7 @@ class Importer:
         if extra_fields:
             for k, v in extra_fields.items():
                 ef_payload[k] = {
-                    "type"       : "string",
+                    "type"       : "text",
                     "value"      : str(v),
                     "group_id"   : 0,
                     "description": "",

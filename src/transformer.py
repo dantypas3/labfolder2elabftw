@@ -16,7 +16,6 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 LOG_DIR = ROOT_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# — configure a file handler for transformer logs —
 TRANS_LOG_FILE = LOG_DIR / "transformer.log"
 file_handler = logging.FileHandler(str(TRANS_LOG_FILE), mode="a")
 file_handler.setFormatter(
@@ -79,11 +78,9 @@ class Transformer:
             experiment_data[row["project_id"]].append(record)
         return experiment_data
 
-    # keep original behavior
     def transform_experiment_data (self) -> Dict[Any, List[Dict[str, Any]]]:
         return self._build_experiment_data(self._entries)
 
-    # new filtered variant for quick tests
     def transform_experiment_data_filtered(self, first_names: List[str]) -> Dict[Any, List[Dict[str, Any]]]:
         filtered = self._filter_entries_by_first_names(first_names)
         if filtered.empty:
@@ -105,7 +102,7 @@ class Transformer:
         entry_htmls.append(self.build_footer_html(project[0]))
         full_body = "".join(entry_htmls)
         extra_fields = self.build_extra_fields(project[0])
-        self._importer.patch_experiment(exp_id, full_body, category, uid=1130,
+        self._importer.patch_experiment(exp_id, full_body, category,
                                         extra_fields=extra_fields)
         return entry_htmls
 
@@ -333,13 +330,13 @@ class Transformer:
         return excel_files
 
     def match_isa_id (self, first_entry: Dict[str, Any]):
-        isa_df = pd.read_csv(ROOT_DIR / "expt-study-link.csv")
+        isa_df = pd.read_csv(ROOT_DIR / "expt-study-link-alexia.csv")
         if isa_df.empty:
             self.logger.error("No ISA-Study mapping found")
 
         for _, row in isa_df.iterrows():
-            if row["Labfolder_project_ID"] == first_entry.get("Labfolder_ID"):
-                return row["ISA_Study_ID"]
+            if str(row["project ID"]) == str(first_entry.get("Labfolder_ID")):
+                return row["ISA-Study-ID"]
 
     def build_extra_fields (self, first_entry: Dict[str, Any]) -> Dict[
         str, Any]:
@@ -347,7 +344,7 @@ class Transformer:
             "Project Owner"        : first_entry.get("project_owner"),
             "Project creation date": first_entry.get("project_creation_date"),
             "Labfolder Project ID" : first_entry.get("Labfolder_ID"),
-            "ISA-Study"            : self.match_isa_id(first_entry)
+            "ISA-Study"            : str(self.match_isa_id(first_entry))
             }
 
     def build_footer_html (self, first_entry: Dict[str, Any]) -> str:

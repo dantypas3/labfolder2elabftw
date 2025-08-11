@@ -347,7 +347,7 @@ class LabFolderFetcher:
                     crate_metadata['@graph'].append(node)
                     files.append(node['@id'])
             else:
-                logger.debug('Skipping unsupported element type %s', typ)
+                logger.warning('Skipping unsupported element type %s', typ)
 
         crate_path = entry_folder / 'crate-metadata.json'
         with crate_path.open('w') as cmf:

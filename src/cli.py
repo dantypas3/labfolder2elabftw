@@ -1,7 +1,35 @@
-# python
 import argparse
+import logging
+import sys
 from pathlib import Path
-from .coordinator import Coordinator
+
+try:
+    import http.client as http_client
+except ImportError:
+    import httplib as http_client  # type: ignore
+
+try:
+    from .coordinator import Coordinator  # type: ignore[import-not-found]
+except Exception:
+    try:
+        from coordinator import Coordinator  # type: ignore[no-redef]
+    except Exception as e:
+        raise ImportError(
+            "Could not import Coordinator. Run as a module (e.g., `python -m your_package`) "
+            "or ensure coordinator.py is importable on PYTHONPATH."
+        ) from e
+
+
+SENSITIVE_KEYS = {"password"}
+
+def mask_sensitive(ns: argparse.Namespace) -> dict:
+    """Return a dict copy of args with sensitive values masked."""
+    data = vars(ns).copy()
+    for k in list(data.keys()):
+        if k in SENSITIVE_KEYS and data[k]:
+            data[k] = "****"
+    return data
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Import Labfolder projects into eLabFTW")
@@ -12,24 +40,66 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-a", "--author", dest="authors", action="append",
                    help="Author first name to include (repeatable). Example: -a Alexia -a Helena")
 
-    # Caching options
     p.add_argument("--entries-parquet", type=Path,
-                   help="Path to a parquet file used to cache entries. "
-                        "If --use-parquet is set, entries will be read from here.")
+                   help=("Path to a parquet file used to cache entries. "
+                         "If --use-parquet is set, entries will be read from here."))
     p.add_argument("--use-parquet", action="store_true",
                    help="Skip fetching from Labfolder and read entries from --entries-parquet.")
 
+    p.add_argument("--debug", action="store_true",
+                   help="Enable verbose debug logging (incl. HTTP wire logs).")
+    p.add_argument("--log-file", type=Path, default=None,
+                   help="Write logs to this file instead of stderr.")
     return p
+
+
+def configure_logging(debug: bool, log_file: Path | None) -> None:
+    level = logging.DEBUG if debug else logging.INFO
+    handlers = []
+    if log_file is not None:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    else:
+        handlers.append(logging.StreamHandler(sys.stderr))
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        handlers=handlers,
+    )
+
+    if debug:
+        http_client.HTTPConnection.debuglevel = 1  # type: ignore[attr-defined]
+        for noisy in ("urllib3", "requests", "httpx"):
+            logging.getLogger(noisy).setLevel(logging.DEBUG)
+            logging.getLogger(noisy).propagate = True
+
 
 def main() -> None:
     args = build_parser().parse_args()
-    coord = Coordinator(username=args.username or "",
-                        password=args.password or "",
-                        url=args.url,
-                        authors=args.authors,
-                        entries_parquet=args.entries_parquet,
-                        use_parquet=args.use_parquet)
-    coord.run()
+    configure_logging(args.debug, args.log_file)
+
+    log = logging.getLogger("cli")
+    log.debug("Parsed args (masked): %s", mask_sensitive(args))
+
+    try:
+        coord = Coordinator(
+            username=args.username or "",
+            password=args.password or "",
+            url=args.url,
+            authors=args.authors,
+            entries_parquet=args.entries_parquet,
+            use_parquet=args.use_parquet,
+        )
+        log.debug("Coordinator initialized")
+        coord.run()
+        log.info("Done.")
+    except KeyboardInterrupt:
+        log.warning("Interrupted by user.")
+        sys.exit(130)
+    except Exception:
+        log.exception("Unhandled error during execution")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

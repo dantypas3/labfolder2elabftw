@@ -15,7 +15,7 @@ class Importer:
     def create_experiment (self, title: str, tags: List[str]) -> str:
         resp = get_fixed("experiments").post(data={
             "title": title,
-            "tags" : tags,
+            "tags" : tags
             })
         try:
             body = resp.json()
@@ -63,7 +63,7 @@ class Importer:
                         continue
                     ef_payload[k] = {
                         "type"       : "items",
-                        "value"      : list_value,
+                        "value"      : "" if not list_value else str(v),
                         "group_id"   : 0,
                         "description": "",
                     }

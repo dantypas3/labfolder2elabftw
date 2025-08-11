@@ -1,4 +1,3 @@
-# python
 from src.fetcher import LabFolderFetcher
 from src.transformer import Transformer
 from src.importer import Importer
@@ -52,7 +51,6 @@ class Coordinator:
                 if series.map(lambda v: isinstance(v, (dict, list))).any():
                     json_cols.append(col)
             except Exception:
-                # Be robust if a column is not easily mappable
                 pass
         return json_cols
 
@@ -92,15 +90,12 @@ class Coordinator:
             json_cols = self._json_cols(df)
             enc = self._encode_json_cols(df, json_cols)
 
-            # Attempt parquet
             enc.to_parquet(path, index=False)
-            # Save sidecar metadata describing JSON-encoded columns
             meta_path = path.with_suffix(path.suffix + ".meta.json")
             meta_path.write_text(json.dumps({"json_cols": json_cols}, indent=2))
             self.logger.info("Saved %d entries to parquet: %s", len(entries), path)
         except Exception as e:
             self.logger.warning("Parquet save failed (%s). Falling back to JSON.gz cache.", e)
-            # Fallback: write JSON lines gzip next to requested parquet path
             gz_path = path.with_suffix(".json.gz")
             import gzip
             with gzip.open(gz_path, "wt", encoding="utf-8") as f:
@@ -116,7 +111,6 @@ class Coordinator:
         if path.exists() and path.suffix == ".parquet":
             try:
                 df = pd.read_parquet(path)
-                # Load sidecar metadata if present
                 meta_path = path.with_suffix(path.suffix + ".meta.json")
                 json_cols: List[str] = []
                 if meta_path.exists():
@@ -133,7 +127,6 @@ class Coordinator:
             except Exception as e:
                 self.logger.warning("Parquet load failed (%s). Will try JSON.gz fallback.", e)
 
-        # Fallback: JSON.gz next to parquet path or explicit path if given as .json.gz
         import gzip
         gz_candidates: List[Path] = []
         if path.suffix == ".json.gz":
@@ -202,6 +195,5 @@ class Coordinator:
             )
 
 if __name__ == "__main__":
-    # Prefer running via the CLI (src/cli.py). This fallback uses placeholders.
     coord = Coordinator("<USERNAME>", "<PASSWORD>")
     coord.run()

@@ -56,11 +56,23 @@ class Importer:
         ef_payload: Dict[str, Any] = {}
         if extra_fields:
             for k, v in extra_fields.items():
-                ef_payload[k] = {
-                    "type"       : "text",
-                    "value"      : str(v),
-                    "group_id"   : 0,
-                    "description": "",
+                if k == "ISA-Study":
+                    list_value = v if isinstance(v, (list, tuple)) else [v]
+                    list_value = [x for x in list_value if x not in (None, "", [])]
+                    if not list_value:
+                        continue
+                    ef_payload[k] = {
+                        "type"       : "items",
+                        "value"      : list_value,
+                        "group_id"   : 0,
+                        "description": "",
+                    }
+                else:
+                    ef_payload[k] = {
+                        "type"       : "text",
+                        "value"      : "" if v is None else str(v),
+                        "group_id"   : 0,
+                        "description": "",
                     }
             groups = set(elab_meta.get("extra_fields_groups", []))
             groups.add(0)

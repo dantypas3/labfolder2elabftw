@@ -9,14 +9,22 @@ from .utils import get_fixed
 class Importer:
     """
     Wraps eLabFTW’s “experiments” endpoint to create, patch experiments,
-    and upload file attachments.
+    upload file attachments, and link experiments to ISA studies (resources).
+
+    In eLabFTW, linking a resource to an experiment is a two‑step process:
+
+    1. Add the resource ID to the experiment metadata via an extra field.
+    2. Create the reciprocal link record in the links table via the
+       `/{entity_type}/{id}/items_links/{subid}` API endpoint.  Without
+       performing step 2, the resource page will not list the experiment as
+       linked even though the extra field contains its ID【21523416964081†L503-L516】.
     """
 
-    def create_experiment (self, title: str, tags: List[str]) -> str:
+    def create_experiment(self, title: str, tags: List[str]) -> str:
         resp = get_fixed("experiments").post(data={
             "title": title,
-            "tags" : tags
-            })
+            "tags": tags
+        })
         try:
             body = resp.json()
             exp_id = str(body.get("id", "")).strip()
@@ -30,9 +38,9 @@ class Importer:
             raise RuntimeError(f"Could not parse experiment ID: {exp_id!r}")
         return exp_id
 
-    def patch_experiment (self, exp_id: str, body: str, category: int,
-                          uid: Optional[int] = None, extra_fields: Optional[
-                Dict[str, Any]] = None, ) -> None:
+    def patch_experiment(self, exp_id: str, body: str, category: int,
+                         uid: Optional[int] = None, extra_fields: Optional[
+            Dict[str, Any]] = None,) -> None:
         if not exp_id.isdigit():
             raise ValueError(f"Invalid experiment ID: {exp_id!r}")
 
@@ -49,9 +57,9 @@ class Importer:
             metadata = raw_meta
 
         elab_meta = metadata.get("elabftw", {
-            "display_main_text"  : True,
+            "display_main_text": True,
             "extra_fields_groups": []
-            })
+        })
 
         ef_payload: Dict[str, Any] = {}
         if extra_fields:
@@ -62,16 +70,16 @@ class Importer:
                     if not list_value:
                         continue
                     ef_payload[k] = {
-                        "type"       : "items",
-                        "value"      : "" if not list_value else str(v),
-                        "group_id"   : 0,
+                        "type": "items",
+                        "value": "" if not list_value else str(v),
+                        "group_id": 0,
                         "description": "",
                     }
                 else:
                     ef_payload[k] = {
-                        "type"       : "text",
-                        "value"      : "" if v is None else str(v),
-                        "group_id"   : 0,
+                        "type": "text",
+                        "value": "" if v is None else str(v),
+                        "group_id": 0,
                         "description": "",
                     }
             groups = set(elab_meta.get("extra_fields_groups", []))
@@ -80,20 +88,19 @@ class Importer:
 
         new_meta: Dict[str, Any] = {
             "elabftw": elab_meta
-            }
+        }
         if ef_payload:
             new_meta["extra_fields"] = ef_payload
 
         payload: Dict[str, Any] = {
-            "body"    : body,
+            "body": body,
             "category": category,
             "metadata": json.dumps(new_meta),
-            "userid"  : uid,
-            }
+        }
 
         ep.patch(endpoint_id=exp_id, data=payload)
 
-    def upload_file (self, exp_id: str, file_path: Path) -> None:
+    def upload_file(self, exp_id: str, file_path: Path) -> None:
         if not exp_id.isdigit():
             raise ValueError(f"Invalid experiment ID for upload: {exp_id!r}")
 
@@ -102,7 +109,21 @@ class Importer:
         with file_path.open("rb") as f:
             files = {
                 "file": (file_path.name, f, mime_type)
-                }
+            }
             get_fixed("experiments").post(endpoint_id=exp_id,
                                           sub_endpoint_name="uploads",
-                                          files=files, )
+                                          files=files,)
+
+    def link_resource (self, exp_id: str, resource_id: str) -> None:
+        if not exp_id.isdigit():
+            raise ValueError(f"Invalid experiment ID for linking: {exp_id!r}")
+        if not resource_id or not str(resource_id).isdigit():
+            raise ValueError(
+                f"Invalid resource ID for linking: {resource_id!r}")
+
+        # /experiments/{exp_id}/items_links/{resource_id}
+        get_fixed("experiments").post(endpoint_id=str(exp_id),
+            sub_endpoint_name="items_links", sub_endpoint_id=str(resource_id),
+            data={
+                "action": "create"
+                }, )

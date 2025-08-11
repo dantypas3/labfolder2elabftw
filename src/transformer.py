@@ -4,13 +4,14 @@ import tempfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 
 from src.fetcher import LabFolderFetcher
 from src.importer import Importer
+
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 LOG_DIR = ROOT_DIR / "logs"
@@ -31,9 +32,9 @@ transformer_logger.addHandler(console_handler)
 
 
 class Transformer:
-    def __init__ (self, entries: List[Dict[str, Any]],
-                  fetcher: LabFolderFetcher, importer: Importer,
-                  logger: logging.Logger = None, ) -> None:
+    def __init__(self, entries: List[Dict[str, Any]],
+                 fetcher: LabFolderFetcher, importer: Importer,
+                 logger: Optional[logging.Logger] = None,) -> None:
         self._entries = pd.DataFrame(entries)
         self._fetcher = fetcher
         self._importer = importer
@@ -55,30 +56,30 @@ class Transformer:
 
         return self._entries[self._entries["author"].apply(match)]
 
-    def _build_experiment_data (self, df: pd.DataFrame) -> Dict[Any, List[Dict[str, Any]]]:
+    def _build_experiment_data(self, df: pd.DataFrame) -> Dict[Any, List[Dict[str, Any]]]:
         experiment_data: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
         for _, row in df.iterrows():
             record = {
-                "name"                 : f"{row['author'].get('first_name')} {row['author'].get('last_name')}",
-                "entry_creation_date"  : row["creation_date"],
-                "elements"             : row["elements"],
-                "entry_number"         : row["entry_number"],
-                "entry_id"             : row["id"],
-                "last_editor_name"     : f"{row['last_editor'].get('first_name')} {row['last_editor'].get('last_name')}",
-                "tags"                 : row["tags"],
-                "entry_title"          : row["title"],
-                "last_edited"          : row["version_date"],
+                "name": f"{row['author'].get('first_name')} {row['author'].get('last_name')}",
+                "entry_creation_date": row["creation_date"],
+                "elements": row["elements"],
+                "entry_number": row["entry_number"],
+                "entry_id": row["id"],
+                "last_editor_name": f"{row['last_editor'].get('first_name')} {row['last_editor'].get('last_name')}",
+                "tags": row["tags"],
+                "entry_title": row["title"],
+                "last_edited": row["version_date"],
                 "project_creation_date": row["project"].get("creation_date"),
-                "labfolder_project_id" : row["project"].get("id"),
-                "number_of_entries"    : row["project"].get("number_of_entries"),
-                "project_title"        : row["project"].get("title"),
-                "project_owner"        : f"{row['author'].get('first_name')} {row['author'].get('last_name')}",
-                "Labfolder_ID"         : row["project"].get("id"),
+                "labfolder_project_id": row["project"].get("id"),
+                "number_of_entries": row["project"].get("number_of_entries"),
+                "project_title": row["project"].get("title"),
+                "project_owner": f"{row['author'].get('first_name')} {row['author'].get('last_name')}",
+                "Labfolder_ID": row["project"].get("id"),
             }
             experiment_data[row["project_id"]].append(record)
         return experiment_data
 
-    def transform_experiment_data (self) -> Dict[Any, List[Dict[str, Any]]]:
+    def transform_experiment_data(self) -> Dict[Any, List[Dict[str, Any]]]:
         return self._build_experiment_data(self._entries)
 
     def transform_experiment_data_filtered(self, first_names: List[str]) -> Dict[Any, List[Dict[str, Any]]]:
@@ -87,34 +88,48 @@ class Transformer:
             self.logger.info("No entries matched first names: %s", first_names)
         return self._build_experiment_data(filtered)
 
-    def transform_projects_content (self, project: List[Dict[str, Any]],
-                                    max_entries: int = None,
-                                    category: int = 38) -> List[str]:
+    def transform_projects_content(self, project: List[Dict[str, Any]],
+                                   max_entries: int = None,
+                                   category: int = 38) -> List[str]:
         title, tags = self.collect_title_and_tags(project)
         exp_id = self._importer.create_experiment(title, tags)
         entry_htmls: List[str] = []
 
+        # Build HTML content for each entry and upload related files
         for idx, entry in enumerate(project, start=1):
             if max_entries and idx > max_entries:
                 break
             entry_htmls.append(self.build_entry_html(entry, exp_id))
 
+        # Append footer and assemble full body text
         entry_htmls.append(self.build_footer_html(project[0]))
         full_body = "".join(entry_htmls)
+
+        # Build extra fields (including ISA‑Study mapping) and patch experiment
         extra_fields = self.build_extra_fields(project[0])
         self._importer.patch_experiment(exp_id, full_body, category,
                                         extra_fields=extra_fields)
+
+        # If an ISA‑Study ID is provided, create the reciprocal link via API
+        isa_id = extra_fields.get("ISA-Study")
+        if isa_id:
+            try:
+                self._importer.link_resource(exp_id, str(isa_id))
+            except Exception as e:
+                # Don't break on failure to link; log and continue
+                self.logger.error("Failed to link ISA-Study %s to experiment %s: %s",
+                                  isa_id, exp_id, e)
+
         return entry_htmls
 
-    def collect_title_and_tags (self, project: List[Dict[str, Any]]) -> Tuple[
-        str, List[str]]:
+    def collect_title_and_tags(self, project: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
         title = project[0].get("project_title", "")
         tags: List[str] = []
         for entry in project:
             tags.extend(entry.get("tags", np.array([])))
         return title, tags
 
-    def build_entry_html (self, entry: Dict[str, Any], exp_id: str) -> str:
+    def build_entry_html(self, entry: Dict[str, Any], exp_id: str) -> str:
         entry_tags = entry.get("tags", [])
         formatted_tags = " ".join(f"§{tag}" for tag in entry_tags)
         header = (
@@ -140,7 +155,7 @@ class Transformer:
                     except Exception as e:
                         self.logger.error(
                             "TABLE Excel conversion/upload failed for %s: %s",
-                            metadata.get("id"), e, )
+                            metadata.get("id"), e,)
                         blocks.append(
                             f"<p>[Failed to convert/upload TABLE to Excel: {metadata.get('id')}]</p>")
                 else:
@@ -163,7 +178,7 @@ class Transformer:
                     except Exception as e:
                         self.logger.error(
                             "WELL_PLATE Excel conversion/upload failed for %s: %s",
-                            metadata.get("id"), e, )
+                            metadata.get("id"), e,)
                         blocks.append(
                             f"<p>[Failed to convert/upload WELL_PLATE to Excel: {metadata.get('id')}]</p>")
                 else:
@@ -211,8 +226,8 @@ class Transformer:
                              f"<td>{d.get('unit')}</td></tr>") for d in
                             data.get("data_elements", [])]
                     table_html = (
-                            "<table><tr><th>Title</th><th>Value</th><th>Unit</th></tr>" + "".join(
-                        rows) + "</table>")
+                        "<table><tr><th>Title</th><th>Value</th><th>Unit</th></tr>" + "".join(
+                            rows) + "</table>")
                     blocks.append(table_html)
                 except Exception as e:
                     self.logger.error("DATA fetch failed for %s: %s",
@@ -231,7 +246,7 @@ class Transformer:
         body_html = ("\n".join(blocks) + "<br>") if blocks else ""
         return header + body_html + created + "<hr><hr>"
 
-    def _export_table_to_excel (self, metadata: Dict[str, Any]) -> List[
+    def _export_table_to_excel(self, metadata: Dict[str, Any]) -> List[
         Tuple[str, Path]]:
         excel_files: List[Tuple[str, Path]] = []
         content = metadata.get("content")
@@ -288,7 +303,7 @@ class Transformer:
 
         return excel_files
 
-    def _export_well_plate_to_excel (self, metadata: Dict[str, Any]) -> List[
+    def _export_well_plate_to_excel(self, metadata: Dict[str, Any]) -> List[
         Tuple[str, Path]]:
         """
         Convert a WELL_PLATE element into one or more Excel files.
@@ -329,7 +344,7 @@ class Transformer:
 
         return excel_files
 
-    def match_isa_id (self, first_entry: Dict[str, Any]):
+    def match_isa_id(self, first_entry: Dict[str, Any]):
         isa_df = pd.read_csv(ROOT_DIR / "expt-study-link-alexia.csv")
         if isa_df.empty:
             self.logger.error("No ISA-Study mapping found")
@@ -338,16 +353,16 @@ class Transformer:
             if str(row["project ID"]) == str(first_entry.get("Labfolder_ID")):
                 return row["ISA-Study-ID"]
 
-    def build_extra_fields (self, first_entry: Dict[str, Any]) -> Dict[
+    def build_extra_fields(self, first_entry: Dict[str, Any]) -> Dict[
         str, Any]:
         return {
-            "Project Owner"        : first_entry.get("project_owner"),
+            "Project Owner": first_entry.get("project_owner"),
             "Project creation date": first_entry.get("project_creation_date"),
-            "Labfolder Project ID" : first_entry.get("Labfolder_ID"),
-            "ISA-Study"            : str(self.match_isa_id(first_entry))
-            }
+            "Labfolder Project ID": first_entry.get("Labfolder_ID"),
+            "ISA-Study": str(self.match_isa_id(first_entry)),
+        }
 
-    def build_footer_html (self, first_entry: Dict[str, Any]) -> str:
+    def build_footer_html(self, first_entry: Dict[str, Any]) -> str:
         return ('<div style="text-align: right; margin-top: 20px;">'
                 '<h5 style="margin:0 0 4px 0;">Labfolder Info</h5>'
                 f"Project created: {first_entry.get('project_creation_date')}<br>"

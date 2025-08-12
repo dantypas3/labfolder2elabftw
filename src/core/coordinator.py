@@ -40,7 +40,7 @@ class Coordinator:
         self._authors = [a.strip() for a in (authors or []) if isinstance(a, str) and a.strip()]
         self._entries_parquet: Optional[Path] = entries_parquet
         self._use_parquet: bool = bool(use_parquet)
-        self._isa_ids = isa_ids,
+        self._isa_ids = isa_ids
         self._namelist = namelist
 
     def _json_cols(self, df: pd.DataFrame) -> List[str]:

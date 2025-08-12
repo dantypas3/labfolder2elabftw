@@ -8,7 +8,7 @@
 *.sqlite3
 *.parquet
 *.ipynb
-*.json
+*.json*
 
 #Directories
 .idea/

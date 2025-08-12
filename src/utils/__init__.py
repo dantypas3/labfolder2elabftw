@@ -13,4 +13,8 @@ def get_fixed(name: str) -> FixedEndpoint:
         path = _ENDPOINT_MAP[name]
     except KeyError as exc:
         raise ValueError(f"No endpoint configured for '{name}'") from exc
+
     return FixedEndpoint(path)
+
+
+__all__ = ["get_fixed", "FixedEndpoint"]

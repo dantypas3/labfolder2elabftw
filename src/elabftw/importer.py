@@ -3,21 +3,12 @@ import mimetypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .utils import get_fixed
-
+from ..utils import get_fixed
 
 class Importer:
     """
     Wraps eLabFTW’s “experiments” endpoint to create, patch experiments,
-    upload file attachments, and link experiments to ISA studies (resources).
-
-    In eLabFTW, linking a resource to an experiment is a two‑step process:
-
-    1. Add the resource ID to the experiment metadata via an extra field.
-    2. Create the reciprocal link record in the links table via the
-       `/{entity_type}/{id}/items_links/{subid}` API endpoint.  Without
-       performing step 2, the resource page will not list the experiment as
-       linked even though the extra field contains its ID【21523416964081†L503-L516】.
+    and upload file attachments.
     """
 
     def create_experiment(self, title: str, tags: List[str]) -> str:
@@ -121,9 +112,11 @@ class Importer:
             raise ValueError(
                 f"Invalid resource ID for linking: {resource_id!r}")
 
-        # /experiments/{exp_id}/items_links/{resource_id}
         get_fixed("experiments").post(endpoint_id=str(exp_id),
             sub_endpoint_name="items_links", sub_endpoint_id=str(resource_id),
             data={
                 "action": "create"
                 }, )
+
+
+__all__ = ["Importer"]

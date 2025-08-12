@@ -3,24 +3,10 @@ import logging
 import sys
 from pathlib import Path
 
-try:
-    import http.client as http_client
-except ImportError:
-    import httplib as http_client  # type: ignore
+import http.client as http_client
+from src.core.coordinator import Coordinator
 
-try:
-    from .coordinator import Coordinator  # type: ignore[import-not-found]
-except Exception:
-    try:
-        from coordinator import Coordinator  # type: ignore[no-redef]
-    except Exception as e:
-        raise ImportError(
-            "Could not import Coordinator. Run as a module (e.g., `python -m your_package`) "
-            "or ensure coordinator.py is importable on PYTHONPATH."
-        ) from e
-
-
-SENSITIVE_KEYS = {"password"}
+SENSITIVE_KEYS = {"password", "username"}
 
 def mask_sensitive(ns: argparse.Namespace) -> dict:
     """Return a dict copy of args with sensitive values masked."""
@@ -29,28 +15,6 @@ def mask_sensitive(ns: argparse.Namespace) -> dict:
         if k in SENSITIVE_KEYS and data[k]:
             data[k] = "****"
     return data
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Import Labfolder projects into eLabFTW")
-    p.add_argument("-u", "--username", required=False, help="Labfolder username")
-    p.add_argument("-p", "--password", required=False, help="Labfolder password")
-    p.add_argument("--url", default="https://labfolder.labforward.app/api/v2",
-                   help="Labfolder API URL")
-    p.add_argument("-a", "--author", dest="authors", action="append",
-                   help="Author first name to include (repeatable). Example: -a Alexia -a Helena")
-
-    p.add_argument("--entries-parquet", type=Path,
-                   help=("Path to a parquet file used to cache entries. "
-                         "If --use-parquet is set, entries will be read from here."))
-    p.add_argument("--use-parquet", action="store_true",
-                   help="Skip fetching from Labfolder and read entries from --entries-parquet.")
-
-    p.add_argument("--debug", action="store_true",
-                   help="Enable verbose debug logging (incl. HTTP wire logs).")
-    p.add_argument("--log-file", type=Path, default=None,
-                   help="Write logs to this file instead of stderr.")
-    return p
 
 
 def configure_logging(debug: bool, log_file: Path | None) -> None:
@@ -74,6 +38,32 @@ def configure_logging(debug: bool, log_file: Path | None) -> None:
             logging.getLogger(noisy).propagate = True
 
 
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Import Labfolder projects into eLabFTW")
+    p.add_argument("-u", "--username", required=True, help="Labfolder username")
+    p.add_argument("-p", "--password", required=True, help="Labfolder password")
+    p.add_argument("--url", default="https://labfolder.labforward.app/api/v2",
+                   help="Labfolder API URL")
+    p.add_argument("-a", "--author", dest="authors", action="append",
+                   help="Author first name to include (repeatable). Example: -a Emma -a James")
+    p.add_argument("--entries-parquet", type=Path,
+                   help="Path to a parquet file used to cache entries. "
+                         "If --use-parquet is set, entries will be read from "
+                         "here. Example: -p entries.parquet")
+    p.add_argument("--use-parquet", action="store_true",
+                   help="Skip fetching from Labfolder and read entries from --entries-parquet.")
+    p.add_argument("--isa-ids", type=Path, required=False,
+                   help="Path to a CSV file containing ISA-IDs CSV.")
+    p.add_argument("--namelist", type=Path, required=False,
+                   help="Path to a CSV file for matching labfolder  "
+                        "with elab users.")
+    p.add_argument("--debug", action="store_true",
+                   help="Enable verbose debug logging (incl. HTTP wire logs).")
+    p.add_argument("--log-file", type=Path, default=None,
+                   help="Write logs to this file instead of stderr.")
+    return p
+
+
 def main() -> None:
     args = build_parser().parse_args()
     configure_logging(args.debug, args.log_file)
@@ -83,12 +73,14 @@ def main() -> None:
 
     try:
         coord = Coordinator(
-            username=args.username or "",
-            password=args.password or "",
+            username=args.username,
+            password=args.password,
             url=args.url,
             authors=args.authors,
             entries_parquet=args.entries_parquet,
             use_parquet=args.use_parquet,
+            isa_ids = args.isa_ids,
+            namelist = args.namelist,
         )
         log.debug("Coordinator initialized")
         coord.run()
@@ -102,4 +94,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+
     main()

@@ -10,7 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from requests import HTTPError
 
-from .labfolder_client import LabfolderClient
+from .client import LabfolderClient
+
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 LOG_DIR = ROOT / 'logs'

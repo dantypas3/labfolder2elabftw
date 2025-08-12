@@ -1,6 +1,6 @@
-from src.fetcher import LabFolderFetcher
-from src.transformer import Transformer
-from src.importer import Importer
+from ..labfolder.fetcher import LabFolderFetcher
+from ..transformer import Transformer
+from ..elabftw.importer import Importer
 import logging
 import json
 from pathlib import Path
@@ -8,9 +8,9 @@ from typing import List, Dict, Any, Optional
 
 import pandas as pd
 
-ROOT_DIR = Path(__file__).resolve().parent
-LOG_DIR  = ROOT_DIR / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+LOG_DIR = ROOT_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 COORD_LOG = LOG_DIR / "coordinator.log"
 
 coord_logger = logging.getLogger("Coordinator")
@@ -30,14 +30,18 @@ class Coordinator:
                  url: str = "https://labfolder.labforward.app/api/v2",
                  authors: Optional[List[str]] = None,
                  entries_parquet: Optional[Path] = None,
-                 use_parquet: bool = False) -> None:
+                 use_parquet: bool = False,
+                 isa_ids : Optional[Path] = None,
+                 namelist : Optional[Path] = None) -> None:
+
         self._client = LabFolderFetcher(username, password, url)
         self._importer = Importer()
         self.logger = coord_logger
         self._authors = [a.strip() for a in (authors or []) if isinstance(a, str) and a.strip()]
-
         self._entries_parquet: Optional[Path] = entries_parquet
         self._use_parquet: bool = bool(use_parquet)
+        self._isa_ids = isa_ids,
+        self._namelist = namelist
 
     def _json_cols(self, df: pd.DataFrame) -> List[str]:
         """
@@ -171,7 +175,10 @@ class Coordinator:
 
         transformer = Transformer(entries=entries,
                                   fetcher=self._client,
-                                  importer=self._importer)
+                                  importer=self._importer,
+                                  isa_ids_list=self._isa_ids,
+                                  namelist=self._namelist
+                                  )
 
         if self._authors:
             self.logger.info("Filtering by authors (first names): %s", ", ".join(self._authors))
@@ -196,4 +203,5 @@ class Coordinator:
 
 if __name__ == "__main__":
     coord = Coordinator("<USERNAME>", "<PASSWORD>")
+
     coord.run()

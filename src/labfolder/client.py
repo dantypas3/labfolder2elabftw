@@ -80,3 +80,5 @@ class LabfolderClient:
         response = self._session.get(url, params=params)
         response.raise_for_status()
         return response
+
+__all__ = ["LabfolderClient"]

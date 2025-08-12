@@ -6,6 +6,9 @@
 A command-line utility for migrating Labfolder projects into an eLabFTW instance. It fetches entries via the Labfolder
 API, transforms them into eLabFTW experiments, uploads attachments, and stores cached copies of fetched entries.
 
+Labfolder2eLabFTW was developed as part of the INF Project of the **CRC 1638** at the [Heidelberg University Biochemistry Center (BZH)](https://bzh.db-engine.de/).
+
+
 ## Features
 
 - Command-line interface for configuring Labfolder credentials, API URL, author filtering, caching, and logging.

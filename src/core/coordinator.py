@@ -172,7 +172,15 @@ class Coordinator:
                     self._save_entries_to_cache(entries, self._entries_parquet)
                 except Exception as e:
                     self.logger.warning("Failed to save entries cache: %s", e)
-
+###
+        entry_to_project = {}
+        for entry in entries:
+            entry_id = str(entry.get("Labfolder_ID") or entry.get("id"))
+            project_id = str(
+                entry.get("labfolder_project_id") or entry.get("project_id") or
+                entry["project"]["id"])
+            entry_to_project[entry_id] = project_id
+###
         transformer = Transformer(entries=entries,
                                   fetcher=self._client,
                                   importer=self._importer,
@@ -194,7 +202,8 @@ class Coordinator:
             )
             html_blocks = transformer.transform_projects_content(
                 project_entries,
-                category=38
+                category=83
+
             )
             self.logger.info(
                 "Finished project %r: %d HTML blocks created",

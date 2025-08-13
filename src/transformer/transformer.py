@@ -5,6 +5,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Union
+from ..utils.pdf import PdfExporter
 
 import numpy as np
 import pandas as pd
@@ -104,7 +105,7 @@ class Transformer:
 
     def transform_projects_content (self, project: List[Dict[str, Any]],
                                     max_entries: int = None,
-                                    category: int = 38) -> List[str]:
+                                    category: int = 83) -> List[str]:
         title, tags = self.collect_title_and_tags(project)
         exp_id = self._importer.create_experiment(title, tags)
         entry_htmls: List[str] = []
@@ -118,8 +119,10 @@ class Transformer:
         full_body = "".join(entry_htmls)
 
         extra_fields = self.build_extra_fields(project[0])
+        uid = self.match_user_id(project[0])
         self._importer.patch_experiment(exp_id, full_body, category,
-                                        extra_fields=extra_fields)
+                                        extra_fields=extra_fields,
+                                        uid=uid,)
 
         isa_id = extra_fields.get("ISA-Study")
         if isa_id:
@@ -129,6 +132,22 @@ class Transformer:
                 self.logger.error(
                     "Failed to link ISA-Study %s to experiment %s: %s",
                     isa_id, exp_id, e)
+
+        try:
+            project_id = project[0].get("labfolder_project_id") or project[
+                0].get("Labfolder_ID")
+            if project_id:
+                pdf_exporter = PdfExporter(self._fetcher)
+                pdf_path = pdf_exporter.export_project_pdf(str(project_id))
+                # Attach the PDF to the newly created eLabFTW experiment
+                self._importer.upload_file(exp_id, pdf_path)
+                self.logger.info(
+                    "Attached project PDF for Labfolder project %s",
+                    project_id)
+        except Exception as e:
+            self.logger.error("Failed to attach PDF export for project %s: %s",
+                              project[0].get("labfolder_project_id") or
+                              project[0].get("Labfolder_ID"), e)
 
         return entry_htmls
 
@@ -157,50 +176,52 @@ class Transformer:
             typ = element.get("type")
 
             if typ == "TABLE":
-                metadata = self._fetcher.fetch_table(element)
-                if metadata:
-                    try:
-                        excel_files = self._export_table_to_excel(metadata)
-                        for sheet_name, xlsx_path in excel_files:
-                            self._importer.upload_file(exp_id, xlsx_path)
-                            blocks.append(
-                                f"<p>[Attached TABLE sheet '{sheet_name}': "
-                                f"{xlsx_path.name}]</p>")
-                    except Exception as e:
-                        self.logger.error(
-                            "TABLE Excel conversion/upload failed for %s: %s",
-                            metadata.get("id"), e, )
-                        blocks.append(
-                            f"<p>[Failed to convert/upload TABLE to Excel: "
-                            f"{metadata.get('id')}]</p>")
-                else:
-                    blocks.append("<p>[Empty or invalid TABLE]</p>")
+                blocks.append("<p>[Skipped TABLE]</p>")
+                # metadata = self._fetcher.fetch_table(element)
+                # if metadata:
+                #     try:
+                #         excel_files = self._export_table_to_excel(metadata)
+                #         for sheet_name, xlsx_path in excel_files:
+                #             self._importer.upload_file(exp_id, xlsx_path)
+                #             blocks.append(
+                #                 f"<p>[Attached TABLE sheet '{sheet_name}': "
+                #                 f"{xlsx_path.name}]</p>")
+                #     except Exception as e:
+                #         self.logger.error(
+                #             "TABLE Excel conversion/upload failed for %s: %s",
+                #             metadata.get("id"), e, )
+                #         blocks.append(
+                #             f"<p>[Failed to convert/upload TABLE to Excel: "
+                #             f"{metadata.get('id')}]</p>")
+                # else:
+                #     blocks.append("<p>[Empty or invalid TABLE]</p>")
 
             elif typ == "WELL_PLATE":
-                metadata = self._fetcher.fetch_well_plate(element)
-                if metadata:
-                    try:
-                        excel_files = self._export_well_plate_to_excel(
-                            metadata)
-                        if excel_files:
-                            for sheet_name, xlsx_path in excel_files:
-                                self._importer.upload_file(exp_id, xlsx_path)
-                                blocks.append(
-                                    f"<p>[Attached WELL_PLATE sheet '"
-                                    f"{sheet_name}': {xlsx_path.name}]</p>")
-                        else:
-                            blocks.append(
-                                "<p>[No data to convert for WELL_PLATE]</p>")
-                    except Exception as e:
-                        self.logger.error(
-                            "WELL_PLATE Excel conversion/upload failed for "
-                            "%s: %s",
-                            metadata.get("id"), e, )
-                        blocks.append(
-                            f"<p>[Failed to convert/upload WELL_PLATE to "
-                            f"Excel: {metadata.get('id')}]</p>")
-                else:
-                    blocks.append("<p>[Empty or invalid WELL_PLATE]</p>")
+                blocks.append("<p>[Skipped WELL PLATE]</p>")
+                # metadata = self._fetcher.fetch_well_plate(element)
+                # if metadata:
+                #     try:
+                #         excel_files = self._export_well_plate_to_excel(
+                #             metadata)
+                #         if excel_files:
+                #             for sheet_name, xlsx_path in excel_files:
+                #                 self._importer.upload_file(exp_id, xlsx_path)
+                #                 blocks.append(
+                #                     f"<p>[Attached WELL_PLATE sheet '"
+                #                     f"{sheet_name}': {xlsx_path.name}]</p>")
+                #         else:
+                #             blocks.append(
+                #                 "<p>[No data to convert for WELL_PLATE]</p>")
+                #     except Exception as e:
+                #         self.logger.error(
+                #             "WELL_PLATE Excel conversion/upload failed for "
+                #             "%s: %s",
+                #             metadata.get("id"), e, )
+                #         blocks.append(
+                #             f"<p>[Failed to convert/upload WELL_PLATE to "
+                #             f"Excel: {metadata.get('id')}]</p>")
+                # else:
+                #     blocks.append("<p>[Empty or invalid WELL_PLATE]</p>")
 
             elif typ == "TEXT":
                 try:
@@ -366,13 +387,41 @@ class Transformer:
         return excel_files
 
     def match_isa_id (self, first_entry: Dict[str, Any]):
-        isa_df = pd.read_csv(self._isa_ids_list)
-        if isa_df.empty:
-            self.logger.error("No ISA-Study mapping found")
+        if not self._isa_ids_list:
+            return None
+        try:
+            user_df = pd.read_csv(self._isa_ids_list)
+        except Exception:
+            return None
+        if user_df.empty:
+            self.logger.error("No user mapping found")
+            return None
+        entry_name = str(first_entry.get("project_owner", "")).strip().lower()
+        for _, row in user_df.iterrows():
+            csv_name = str(row["User"]).strip().lower()
+            if csv_name == entry_name:
+                return row["Resource ID"]
+        self.logger.warning("No Resource ID found for %s", entry_name)
+        return None
 
-        for _, row in isa_df.iterrows():
-            if str(row["project ID"]) == str(first_entry.get("Labfolder_ID")):
-                return row["ISA-Study-ID"]
+    def match_user_id (self, first_entry: Dict[str, Any]):
+        if not self._namelist:
+            return 847
+        try:
+            user_df = pd.read_csv(self._namelist)
+        except Exception:
+            return 847
+        if user_df.empty:
+            self.logger.error("No user mapping found")
+            return 847
+        entry_name = str(first_entry.get("project_owner", "")).strip().lower()
+        for _, row in user_df.iterrows():
+            csv_name = str(
+                f"{row['First Name']} {row['Last Name']}").strip().lower()
+            if csv_name == entry_name:
+                return row["User ID"]
+        self.logger.warning("No User ID found for %s", entry_name)
+        return 847
 
     def build_extra_fields (self, first_entry: Dict[str, Any]) -> Dict[
         str, Any]:

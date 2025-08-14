@@ -1,0 +1,159 @@
+
+*** Begin Patch
+*** Update File: fetcher.py
+@@
+-import hashlib
+-import json
+-import logging
+-import mimetypes
+-import tempfile
+-import uuid
++import hashlib
++import json
++import logging
++import mimetypes
++import tempfile
++import uuid
++import time
++import zipfile
+@@
+ class LabFolderFetcher:
+@@
+     def _get (self, endpoint: str,
+               params: Optional[Dict[str, Any]] = None) -> requests.Response:
+         try:
+             return self._client.get(endpoint, params=params)
+         except HTTPError as e:
+             if e.response.status_code == 401:
+                 logger.info('Token expired, re-logging in')
+                 self._client.login()
+                 return self._client.get(endpoint, params=params)
+             raise
++
++    # ---- generic helpers -------------------------------------------------
++    def _post(self, endpoint: str, json_data: Optional[Dict[str, Any]] = None) -> requests.Response:
++        """
++        Minimal POST helper using the authenticated session.
++        """
++        url = f"{self.base_url}/{endpoint}"
++        resp = self._client._session.post(url, json=json_data or {})  # type: ignore[attr-defined]
++        resp.raise_for_status()
++        return resp
++
++    # ---- PDF export API --------------------------------------------------
++    def create_pdf_export(
++        self,
++        project_ids: List[str],
++        download_filename: str,
++        *,
++        preserve_entry_layout: bool = True,
++        include_hidden_items: bool = False,
++    ) -> str:
++        """
++        POST /exports/pdf
++        Returns newly created export id.
++        """
++        payload = {
++            "download_filename": download_filename,
++            "settings": {"preserve_entry_layout": bool(preserve_entry_layout)},
++            "content": {"project_ids": [str(x) for x in project_ids],
++                        "entry_ids": [], "template_ids": [], "group_ids": []},
++            "include_hidden_items": bool(include_hidden_items),
++        }
++        self._post("exports/pdf", json_data=payload)
++        # Find the newest export for this user
++        exports = self.list_pdf_exports(status="NEW,RUNNING,QUEUED,FINISHED", limit=50)
++        if not exports:
++            raise RuntimeError("PDF export creation returned no exports")
++        # pick most recent by creation_date
++        exports.sort(key=lambda e: e.get("creation_date",""), reverse=True)
++        return exports[0]["id"]
++
++    def list_pdf_exports(self, status: Optional[str] = None, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
++        params: Dict[str, Any] = {"limit": limit, "offset": offset}
++        if status:
++            params["status"] = status
++        resp = self._get("exports/pdf", params=params)
++        data = resp.json()
++        return data if isinstance(data, list) else []
++
++    def get_pdf_export(self, export_id: str) -> Dict[str, Any]:
++        resp = self._get(f"exports/pdf/{export_id}")
++        return resp.json()
++
++    def wait_for_pdf_export(self, export_id: str, poll_seconds: int = 3, timeout: int = 900) -> None:
++        """
++        Poll until FINISHED or ERROR.
++        """
++        deadline = time.time() + timeout
++        while time.time() < deadline:
++            info = self.get_pdf_export(export_id)
++            status = (info.get("status") or "").upper()
++            if status == "FINISHED":
++                return
++            if status in {"ERROR", "REMOVED", "ABORT_PARALLEL"}:
++                raise RuntimeError(f"PDF export {export_id} failed with status {status}")
++            time.sleep(poll_seconds)
++        raise TimeoutError(f"Timed out waiting for PDF export {export_id}")
++
++    def download_pdf_export(self, export_id: str, dest_path: Path) -> Path:
++        url = f"exports/pdf/{export_id}/download"
++        resp = self._get(url)
++        dest_path.parent.mkdir(parents=True, exist_ok=True)
++        with dest_path.open("wb") as f:
++            for chunk in resp.iter_content(chunk_size=8192):
++                f.write(chunk)
++        return dest_path
++
++    # ---- XHTML export API ------------------------------------------------
++    def create_xhtml_export(self, *, include_hidden_items: bool = False) -> str:
++        """
++        POST /exports/xhtml
++        Labfolder only accepts a full-account export for XHTML.
++        """
++        payload = {"include_hidden_items": bool(include_hidden_items)}
++        self._post("exports/xhtml", json_data=payload)
++        exports = self.list_xhtml_exports(status="NEW,RUNNING,QUEUED,FINISHED", limit=50)
++        if not exports:
++            raise RuntimeError("XHTML export creation returned no exports")
++        exports.sort(key=lambda e: e.get("creation_date",""), reverse=True)
++        return exports[0]["id"]
++
++    def list_xhtml_exports(self, status: Optional[str] = None, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
++        params: Dict[str, Any] = {"limit": limit, "offset": offset}
++        if status:
++            params["status"] = status
++        resp = self._get("exports/xhtml", params=params)
++        data = resp.json()
++        return data if isinstance(data, list) else []
++
++    def get_xhtml_export(self, export_id: str) -> Dict[str, Any]:
++        resp = self._get(f"exports/xhtml/{export_id}")
++        return resp.json()
++
++    def wait_for_xhtml_export(self, export_id: str, poll_seconds: int = 5, timeout: int = 1800) -> None:
++        deadline = time.time() + timeout
++        while time.time() < deadline:
++            info = self.get_xhtml_export(export_id)
++            status = (info.get("status") or "").upper()
++            if status == "FINISHED":
++                return
++            if status in {"ERROR", "REMOVED", "ABORT_PARALLEL"}:
++                raise RuntimeError(f"XHTML export {export_id} failed with status {status}")
++            time.sleep(poll_seconds)
++        raise TimeoutError(f"Timed out waiting for XHTML export {export_id}")
++
++    def download_xhtml_export(self, export_id: str, dest_zip: Path) -> Path:
++        resp = self._get(f"exports/xhtml/{export_id}/download")
++        dest_zip.parent.mkdir(parents=True, exist_ok=True)
++        with dest_zip.open("wb") as f:
++            for chunk in resp.iter_content(chunk_size=8192):
++                f.write(chunk)
++        return dest_zip
++
++    def extract_zip(self, zip_path: Path, out_dir: Path) -> Path:
++        out_dir.mkdir(parents=True, exist_ok=True)
++        with zipfile.ZipFile(zip_path, "r") as zf:
++            zf.extractall(out_dir)
++        return out_dir
+*** End Patch

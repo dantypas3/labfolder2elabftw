@@ -104,18 +104,20 @@ class Importer:
 
 
     def upload_file (self, exp_id: str, file_path: Path) -> None:
-            if not exp_id.isdigit():
-                raise ValueError(f"Invalid experiment ID for upload: {exp_id!r}")
+        if not exp_id.isdigit():
+            raise ValueError(f"Invalid experiment ID for upload: {exp_id!r}")
 
-            mime_type, _ = mimetypes.guess_type(file_path.as_posix())
-            mime_type = mime_type or "application/octet-stream"
-            with file_path.open("rb") as f:
-                files = {
-                    "file": (file_path.name, f, mime_type)
-                    }
-            (get_fixed("experiments").post(endpoint_id=exp_id,
-                                            sub_endpoint_name="uploads",
-                                            files=files))
+        mime_type, _ = mimetypes.guess_type(file_path.as_posix())
+        mime_type = mime_type or "application/octet-stream"
+
+        # IMPORTANT: keep the file handle open while posting
+        with file_path.open("rb") as f:
+            files = {"file": (file_path.name, f, mime_type)}
+            get_fixed("experiments").post(
+                endpoint_id=exp_id,
+                sub_endpoint_name="uploads",
+                files=files,
+            )
 
     def link_resource (self, exp_id: str, resource_id: str) -> None:
         if not exp_id.isdigit():

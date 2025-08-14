@@ -1,0 +1,74 @@
+
+*** Begin Patch
+*** Update File: transformer.py
+@@
+-    def transform_projects_content (self, project: List[Dict[str, Any]],
+-                                    max_entries: int = None,
+-                                    category: int = 83) -> List[str]:
++    def transform_projects_content (self, project: List[Dict[str, Any]],
++                                    max_entries: int = None,
++                                    category: int = 83,
++                                    xhtml_root: Optional[Path] = None) -> List[str]:
+@@
+-        self._importer.patch_experiment(exp_id, full_body, category,
++        self._importer.patch_experiment(exp_id, full_body, category,
+                                         extra_fields=extra_fields)
+@@
+-        return entry_htmls
++        # After body is saved, optionally attach XHTML assets (index.html + *.xlsx)
++        try:
++            self._attach_xhtml_artifacts(exp_id, project, xhtml_root)
++        except Exception as e:
++            self.logger.error("Failed to attach XHTML artifacts: %s", e)
++
++        return entry_htmls
++
++    def _attach_xhtml_artifacts(self, exp_id: str, project: List[Dict[str, Any]], xhtml_root: Optional[Path]) -> None:
++        """
++        Attach `index.html` and all `*.xlsx` files from the Labfolder XHTML export
++        that belong to the given project (by matching entry IDs in folder names
++        or filenames).
++        """
++        if not xhtml_root or not Path(xhtml_root).exists():
++            return
++
++        entry_ids = {str(p.get("entry_id")) for p in project if p.get("entry_id")}
++        if not entry_ids:
++            return
++
++        # Search strategy:
++        #  1) prefer directories whose name contains the entry id and attach their
++        #     index.html plus any *.xlsx
++        #  2) additionally, sweep for *.xlsx files whose filename contains the id
++        #     (as Labfolder sometimes encodes ids in filenames).
++        attached: set[Path] = set()
++        for entry_id in entry_ids:
++            # dir match: */<something-with-entry_id>/*
++            for candidate in Path(xhtml_root).rglob(f"*{entry_id}*"):
++                if candidate.is_dir():
++                    idx = candidate / "index.html"
++                    if idx.exists() and idx not in attached:
++                        try:
++                            self._importer.upload_file(exp_id, idx)
++                            attached.add(idx)
++                            self.logger.info("Attached XHTML index for entry %s: %s", entry_id, idx.name)
++                        except Exception as e:
++                            self.logger.warning("Failed to attach %s: %s", idx, e)
++                    for x in candidate.glob("*.xlsx"):
++                        if x not in attached:
++                            try:
++                                self._importer.upload_file(exp_id, x)
++                                attached.add(x)
++                                self.logger.info("Attached XLSX for entry %s: %s", entry_id, x.name)
++                            except Exception as e:
++                                self.logger.warning("Failed to attach %s: %s", x, e)
++            # filename match for stray files
++            for x in Path(xhtml_root).rglob(f"*{entry_id}*.xlsx"):
++                if x.is_file() and x not in attached:
++                    try:
++                        self._importer.upload_file(exp_id, x)
++                        attached.add(x)
++                        self.logger.info("Attached XLSX for entry %s: %s", entry_id, x.name)
++                    except Exception as e:
++                        self.logger.warning("Failed to attach %s: %s", x, e)
+*** End Patch

@@ -4,63 +4,92 @@ import logging
 import mimetypes
 import tempfile
 import uuid
+import time
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from requests import HTTPError
 
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+try:
+    from tqdm import tqdm
+except Exception:  # tqdm optional fallback
+    tqdm = None
+
+
+# If you are not using packages, change to: from client import LabfolderClient
 from .client import LabfolderClient
 
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / 'logs'
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / 'labfolder_fetcher.log'
 
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    handlers=[logging.StreamHandler(), logging.FileHandler(str(LOG_FILE)), ], )
+    handlers=[logging.StreamHandler(), logging.FileHandler(str(LOG_FILE))]
+)
 logger = logging.getLogger(__name__)
 
 
 class LabFolderFetcher:
-    '''
-    Wraps the Labfolder client to fetch entries, handle token refresh,
-    and save elements including TABLE, WELL_PLATE, TEXT, FILE, IMAGE, DATA.
-    '''
+    """
+    Wraps the Labfolder client to fetch entries and files.
+    Also exposes PDF/XHTML export helpers with robust download & ZIP validation.
+    """
 
-    def __init__ (self, email: str, password: str, base_url: str) -> None:
+    def __init__(self, email: str, password: str, base_url: str) -> None:
         self.email = email
         self.password = password
         self.base_url = base_url.rstrip('/')
         self._client = LabfolderClient(email, password, self.base_url)
         self._client.login()
 
-    def _get (self, endpoint: str,
-              params: Optional[Dict[str, Any]] = None) -> requests.Response:
+    # ---------------------------
+    # Low-level GET/POST helpers
+    # ---------------------------
+    def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+        """Authenticated GET with 401 refresh."""
         try:
             return self._client.get(endpoint, params=params)
         except HTTPError as e:
-            if e.response.status_code == 401:
+            if e.response is not None and e.response.status_code == 401:
                 logger.info('Token expired, re-logging in')
                 self._client.login()
                 return self._client.get(endpoint, params=params)
             raise
 
-    def fetch_entries (self, expand: Optional[List[str]] = None,
-                       limit: int = 50, include_hidden: bool = True) -> List[
-        Dict[str, Any]]:
+    def _post(self, endpoint: str, json_data: Optional[Dict[str, Any]] = None) -> requests.Response:
+        """Authenticated POST with 401 refresh."""
+        url = f"{self.base_url}/{endpoint}"
+        resp = self._client._session.post(url, json=json_data or {})  # type: ignore[attr-defined]
+        if resp.status_code == 401:
+            logger.info('401 on POST; re-logging in and retrying')
+            self._client.login()
+            resp = self._client._session.post(url, json=json_data or {})  # type: ignore[attr-defined]
+        resp.raise_for_status()
+        return resp
+
+    # ---------------------------
+    # Entries / elements
+    # ---------------------------
+    def fetch_entries(self, expand: Optional[List[str]] = None,
+                      limit: int = 50, include_hidden: bool = True) -> List[Dict[str, Any]]:
         entries: List[Dict[str, Any]] = []
         offset = 0
         expand_str = ','.join(expand) if expand else None
 
         while True:
             params: Dict[str, Any] = {
-                'limit'         : limit,
-                'offset'        : offset,
+                'limit': limit,
+                'offset': offset,
                 'include_hidden': include_hidden,
-                }
+            }
             if expand_str:
                 params['expand'] = expand_str
             resp = self._get('entries', params=params)
@@ -73,9 +102,8 @@ class LabFolderFetcher:
             offset += limit
         return entries
 
-    def fetch_text (self, element: Dict[str, Any]) -> str:
-        text_id = f"elements/text/{element['id']}"
-        resp = self._get(text_id)
+    def fetch_text(self, element: Dict[str, Any]) -> str:
+        resp = self._get(f"elements/text/{element['id']}")
         return resp.json().get('content', '')
 
     def fetch_file (self, element: Dict[str, Any]) -> Optional[Path]:
@@ -83,7 +111,6 @@ class LabFolderFetcher:
         if not file_id:
             logger.error('Invalid file element (no id) %r', element)
             return None
-
         try:
             resp = self._get(f"elements/file/{file_id}/download")
         except HTTPError as e:
@@ -91,30 +118,26 @@ class LabFolderFetcher:
             return None
 
         content_disp = resp.headers.get('Content-Disposition', '')
-        filename = 'unnamed_file'
+        filename = 'file.bin'
         if 'filename=' in content_disp:
             parts = content_disp.split('filename=')
             if len(parts) > 1:
                 filename = parts[-1].strip().strip('"')
 
-        tmp_dir = Path(tempfile.gettempdir())
-        temp_path = tmp_dir / filename
+        temp_path = Path(tempfile.gettempdir()) / filename
         try:
-            with temp_path.open('wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        except (OSError, requests.exceptions.RequestException) as e:
+            self._download_with_progress(resp, temp_path,
+                                         desc=f"FILE {filename}")
+            return temp_path
+        except Exception as e:
             logger.error('Error writing file %s: %s', temp_path, e)
             return None
 
-        return temp_path
-
-    def fetch_image (self, element: Dict[str, Any]) -> Optional[Path]:
+    def fetch_image(self, element: Dict[str, Any]) -> Optional[Path]:
         image_id = element.get('id')
         if not image_id:
             logger.error('Invalid image element (no id) %r', element)
             return None
-
         try:
             resp = self._get(f"elements/image/{image_id}/original-data")
         except HTTPError as e:
@@ -137,10 +160,9 @@ class LabFolderFetcher:
         except (OSError, requests.exceptions.RequestException) as e:
             logger.error('Error writing image file %s: %s', temp_path, e)
             return None
-
         return temp_path
 
-    def fetch_data (self, element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def fetch_data(self, element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         data_id = element.get('id')
         if not data_id:
             logger.error('Invalid data element (no id): %r', element)
@@ -152,12 +174,10 @@ class LabFolderFetcher:
             logger.error('Failed to fetch data element %s: %s', data_id, e)
             return None
         except ValueError as e:
-            logger.error('Invalid JSON returned for data element %s: %s',
-                         data_id, e)
+            logger.error('Invalid JSON for data element %s: %s', data_id, e)
             return None
 
-    def fetch_table (self, element: Dict[str, Any]) -> Optional[
-        Dict[str, Any]]:
+    def fetch_table(self, element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         table_id = element.get('id')
         if not table_id:
             logger.error('Invalid table element (no id): %r', element)
@@ -169,12 +189,10 @@ class LabFolderFetcher:
             logger.error('Failed to fetch table element %s: %s', table_id, e)
             return None
         except ValueError as e:
-            logger.error('Invalid JSON returned for table element %s: %s',
-                         table_id, e)
+            logger.error('Invalid JSON for table element %s: %s', table_id, e)
             return None
 
-    def fetch_well_plate (self, element: Dict[str, Any]) -> Optional[
-        Dict[str, Any]]:
+    def fetch_well_plate(self, element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         plate_id = element.get('id')
         if not plate_id:
             logger.error('Invalid well plate element (no id): %r', element)
@@ -183,173 +201,216 @@ class LabFolderFetcher:
             resp = self._get(f"elements/well-plate/{plate_id}")
             return resp.json()
         except HTTPError as e:
-            logger.error('Failed to fetch well plate element %s: %s', plate_id,
-                         e)
+            logger.error('Failed to fetch well plate %s: %s', plate_id, e)
             return None
         except ValueError as e:
-            logger.error('Invalid JSON returned for well plate element %s: %s',
-                         plate_id, e)
+            logger.error('Invalid JSON for well plate %s: %s', plate_id, e)
             return None
 
-    def __get_node_from_metadata (self, json_metadata: Dict[str, Any],
-                                  entry_folder: Path) -> Dict[str, Any]:
-        node: Dict[str, Any] = {}
-        node['@id'] = f"./{entry_folder.name}/{json_metadata.get('id')}"
-        node['@type'] = 'File'
-        node['name'] = json_metadata.get('file_name') or json_metadata.get(
-            'title') or 'Unknown'
-        size = int(json_metadata.get('file_size', 0))
-        if size > 0:
-            node['contentSize'] = size
-        node['encodingFormat'] = json_metadata.get(
-            'content_type') or json_metadata.get('original_file_content_type')
-        return node
+    # ---------------------------------------------------------------------
+    # PDF export API (optional)
+    # ---------------------------------------------------------------------
+    def create_pdf_export(
+        self,
+        project_ids: List[str],
+        download_filename: str,
+        *,
+        preserve_entry_layout: bool = True,
+        include_hidden_items: bool = False,
+    ) -> str:
+        payload = {
+            "download_filename": download_filename,
+            "settings": {"preserve_entry_layout": bool(preserve_entry_layout)},
+            "content": {
+                "project_ids": [str(x) for x in project_ids],
+                "entry_ids": [],
+                "template_ids": [],
+                "group_ids": [],
+            },
+            "include_hidden_items": bool(include_hidden_items),
+        }
+        self._post("exports/pdf", json_data=payload)
+        exports = self.list_pdf_exports(status="NEW,RUNNING,QUEUED,FINISHED", limit=50)
+        if not exports:
+            raise RuntimeError("PDF export creation returned no exports")
+        exports.sort(key=lambda e: e.get("creation_date", ""), reverse=True)
+        return exports[0]["id"]
 
-    def __get_csvs_from_json (self, json_metadata: Dict[str, Any]) -> List[
-        Tuple[str, str]]:
-        sheets = json_metadata.get('sheets', {})
-        return [(name, content) for name, content in sheets.items()]
+    def list_pdf_exports(self, status: Optional[str] = None, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if status:
+            params["status"] = status
+        resp = self._get("exports/pdf", params=params)
+        data = resp.json()
+        return data if isinstance(data, list) else []
 
-    def __get_unique_enough_id (self) -> str:
-        return str(uuid.uuid4())
+    def get_pdf_export(self, export_id: str) -> Dict[str, Any]:
+        resp = self._get(f"exports/pdf/{export_id}")
+        return resp.json()
 
-    def __get_node_from_csv (self, csv_id: str, csv_content: str,
-                             entry_folder: Path) -> Dict[str, Any]:
-        node: Dict[str, Any] = {}
-        node['@id'] = f"./{entry_folder.name}/{csv_id}.csv"
-        node['@type'] = 'File'
-        node['name'] = f'{csv_id}.csv'
-        node['encodingFormat'] = 'text/csv'
-        node['contentSize'] = len(csv_content)
-        return node
+    def wait_for_pdf_export(self, export_id: str, poll_seconds: int = 3, timeout: int = 900) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            info = self.get_pdf_export(export_id)
+            status = (info.get("status") or "").upper()
+            if status == "FINISHED":
+                return
+            if status in {"ERROR", "REMOVED", "ABORT_PARALLEL"}:
+                raise RuntimeError(f"PDF export {export_id} failed with status {status}")
+            time.sleep(poll_seconds)
+        raise TimeoutError(f"Timed out waiting for PDF export {export_id}")
 
-    def _handle_table_element (self, element: Dict[str, Any],
-                               entry_folder: Path,
-                               crate_metadata: Dict[str, Any],
-                               files: List[str]) -> None:
-        if element['type'] == 'TABLE':
-            json_metadata = self.fetch_table(element)
+    def download_pdf_export (self, export_id: str, dest_path: Path) -> Path:
+        url = f"{self.base_url}/exports/pdf/{export_id}/download"
+        resp = self._client._session.get(url, stream=True,
+                                         allow_redirects=True)  # type: ignore[attr-defined]
+        if resp.status_code == 401:
+            logger.info('401 on PDF download; re-logging in and retrying')
+            self._client.login()
+            resp = self._client._session.get(url, stream=True,
+                                             allow_redirects=True)  # type: ignore[attr-defined]
+        resp.raise_for_status()
+        return self._download_with_progress(resp, dest_path,
+                                            desc="Project PDF")
+
+    def wait_for_xhtml_export (self, export_id: str, poll_seconds: int = 10,
+                               timeout: int = 7200) -> None:
+        deadline = time.time() + timeout
+        spinner = None
+        if tqdm and sys.stdout.isatty():
+            spinner = tqdm(total=None, desc="Preparing XHTML on server",
+                           bar_format="{desc}: {elapsed}")
+        try:
+            last_status = ""
+            while time.time() < deadline:
+                info = self.get_xhtml_export(export_id)
+                status = (info.get("status") or "").upper()
+                if spinner:
+                    if status != last_status:
+                        spinner.set_description_str(
+                            f"Preparing XHTML on server [{status}]")
+                        last_status = status
+                    spinner.update(0)
+                if status == "FINISHED":
+                    return
+                if status in {"ERROR", "REMOVED", "ABORT_PARALLEL"}:
+                    raise RuntimeError(
+                        f"XHTML export {export_id} failed with status {status}")
+                time.sleep(poll_seconds)
+            raise TimeoutError(
+                f"Timed out waiting for XHTML export {export_id}")
+        finally:
+            if spinner:
+                spinner.close()
+
+    # ---------------------------------------------------------------------
+    # XHTML export API (global export by Labfolder design)
+    # ---------------------------------------------------------------------
+    def create_xhtml_export(self, *, include_hidden_items: bool = False) -> str:
+        payload = {"include_hidden_items": bool(include_hidden_items)}
+        self._post("exports/xhtml", json_data=payload)
+        exports = self.list_xhtml_exports(status="NEW,RUNNING,QUEUED,FINISHED", limit=50)
+        if not exports:
+            raise RuntimeError("XHTML export creation returned no exports")
+        exports.sort(key=lambda e: e.get("creation_date", ""), reverse=True)
+        return exports[0]["id"]
+
+    def list_xhtml_exports(self, status: Optional[str] = None, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if status:
+            params["status"] = status
+        resp = self._get("exports/xhtml", params=params)
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    def get_xhtml_export(self, export_id: str) -> Dict[str, Any]:
+        resp = self._get(f"exports/xhtml/{export_id}")
+        return resp.json()
+
+
+    def wait_for_xhtml_export (self, export_id: str, poll_seconds: int = 10,
+                               timeout: int = 7200) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            info = self.get_xhtml_export(export_id)
+            status = (info.get("status") or "").upper()
+            if status == "FINISHED":
+                return
+            if status in {"ERROR", "REMOVED", "ABORT_PARALLEL"}:
+                raise RuntimeError(
+                    f"XHTML export {export_id} failed with status {status}")
+            time.sleep(poll_seconds)
+        raise TimeoutError(f"Timed out waiting for XHTML export {export_id}")
+
+    def download_xhtml_export (self, export_id: str, dest_zip: Path) -> Path:
+        url = f"{self.base_url}/exports/xhtml/{export_id}/download"
+        resp = self._client._session.get(url, stream=True,
+                                         allow_redirects=True)  # type: ignore[attr-defined]
+        if resp.status_code == 401:
+            logger.info('401 on XHTML download; re-logging in and retrying')
+            self._client.login()
+            resp = self._client._session.get(url, stream=True,
+                                             allow_redirects=True)  # type: ignore[attr-defined]
+        resp.raise_for_status()
+
+        self._download_with_progress(resp, dest_zip, desc="XHTML export (ZIP)")
+
+        # Validate ZIP
+        if not zipfile.is_zipfile(dest_zip):
+            ct = resp.headers.get('Content-Type', '')
+            size = dest_zip.stat().st_size if dest_zip.exists() else 0
+            try:
+                dest_zip.unlink(missing_ok=True)  # type: ignore[arg-type]
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Downloaded XHTML is not a ZIP (content-type={ct!r}, bytes={size}).")
+        return dest_zip
+
+    def extract_zip(self, zip_path: Path, out_dir: Path) -> Path:
+        """
+        Extract a verified ZIP. If invalid, raise with a clear message.
+        """
+        if not zipfile.is_zipfile(zip_path):
+            raise RuntimeError(f"Not a valid ZIP: {zip_path}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(out_dir)
+        return out_dir
+
+    def _download_with_progress (self, resp, dest_path: Path,
+                                 desc: str) -> Path:
+        """
+        Stream 'resp' body to 'dest_path' with a tqdm progress bar (if available).
+        Works even when Content-Length is unknown.
+        """
+        total = None
+        try:
+            total_hdr = resp.headers.get("Content-Length")
+            total = int(total_hdr) if total_hdr else None
+        except Exception:
+            total = None
+
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if tqdm and sys.stdout.isatty():
+            bar = tqdm(total=total, unit="B", unit_scale=True,
+                       unit_divisor=1024, desc=desc)
+            try:
+                with dest_path.open("wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        bar.update(len(chunk))
+            finally:
+                bar.close()
         else:
-            json_metadata = self.fetch_well_plate(element)
-        if not json_metadata:
-            return
-        node = self.__get_node_from_metadata(json_metadata, entry_folder)
-        json_path = entry_folder / f"{json_metadata['id']}.json"
-        with json_path.open('w') as jf:
-            json.dump(json_metadata, jf, indent=2)
-        node['sha256'] = hashlib.sha256(
-            json.dumps(json_metadata, indent=2).encode()).hexdigest()
-        crate_metadata['@graph'].append(node)
-        files.append(node['@id'])
-        csvs = self.__get_csvs_from_json(json_metadata)
-        for sheet_name, csv_content in csvs:
-            csv_id = self.__get_unique_enough_id()
-            csv_node = self.__get_node_from_csv(csv_id, csv_content,
-                                                entry_folder)
-            csv_path = entry_folder / f"{csv_id}.csv"
-            with csv_path.open('w') as cf:
-                cf.write(csv_content)
-            csv_node['sha256'] = hashlib.sha256(
-                csv_content.encode()).hexdigest()
-            crate_metadata['@graph'].append(csv_node)
-            files.append(csv_node['@id'])
+            # Fallback: simple streaming without fancy UI
+            with dest_path.open("wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        return dest_path
 
-    def process_entry (self, entry: Dict[str, Any], output_dir: Path) -> None:
-        '''
-        Process a single entry: creates its folder, fetches each element type,
-        saves to disk, builds crate_metadata graph and file list.
-        '''
-        entry_folder = output_dir / str(entry['id'])
-        entry_folder.mkdir(parents=True, exist_ok=True)
-        crate_metadata: Dict[str, Any] = {
-            '@graph': []
-            }
-        files: List[str] = []
 
-        for element in entry.get('elements', []):
-            typ = element.get('type')
-            if typ in ('TABLE', 'WELL_PLATE'):
-                self._handle_table_element(element, entry_folder,
-                                           crate_metadata, files)
-            elif typ == 'TEXT':
-                content = self.fetch_text(element)
-                text_filename = f"{element['id']}.txt"
-                text_path = entry_folder / text_filename
-                with text_path.open('w') as tf:
-                    tf.write(content)
-                sha = hashlib.sha256(content.encode()).hexdigest()
-                node = {
-                    '@id'           : f"./{entry_folder.name}/{text_filename}",
-                    '@type'         : 'Text',
-                    'name'          : text_filename,
-                    'contentSize'   : len(content),
-                    'encodingFormat': 'text/plain',
-                    'sha256'        : sha
-                    }
-                crate_metadata['@graph'].append(node)
-                files.append(node['@id'])
-            elif typ == 'FILE':
-                file_path = self.fetch_file(element)
-                if file_path and file_path.exists():
-                    dest = entry_folder / file_path.name
-                    file_path.replace(dest)
-                    size = dest.stat().st_size
-                    mimetype, _ = mimetypes.guess_type(dest)
-                    encoding = mimetype or 'application/octet-stream'
-                    data = dest.read_bytes()
-                    sha = hashlib.sha256(data).hexdigest()
-                    node = {
-                        '@id'           : f"./{entry_folder.name}/{dest.name}",
-                        '@type'         : 'File',
-                        'name'          : dest.name,
-                        'contentSize'   : size,
-                        'encodingFormat': encoding,
-                        'sha256'        : sha
-                        }
-                    crate_metadata['@graph'].append(node)
-                    files.append(node['@id'])
-            elif typ == 'IMAGE':
-                img_path = self.fetch_image(element)
-                if img_path and img_path.exists():
-                    dest = entry_folder / img_path.name
-                    img_path.replace(dest)
-                    size = dest.stat().st_size
-                    mimetype, _ = mimetypes.guess_type(dest)
-                    encoding = mimetype or 'image/*'
-                    data = dest.read_bytes()
-                    sha = hashlib.sha256(data).hexdigest()
-                    node = {
-                        '@id'           : f"./{entry_folder.name}/{dest.name}",
-                        '@type'         : 'Image',
-                        'name'          : dest.name,
-                        'contentSize'   : size,
-                        'encodingFormat': encoding,
-                        'sha256'        : sha
-                        }
-                    crate_metadata['@graph'].append(node)
-                    files.append(node['@id'])
-            elif typ == 'DATA':
-                json_data = self.fetch_data(element)
-                if json_data:
-                    data_filename = f"{element['id']}.json"
-                    data_path = entry_folder / data_filename
-                    with data_path.open('w') as df:
-                        json.dump(json_data, df, indent=2)
-                    sha = hashlib.sha256(
-                        json.dumps(json_data).encode()).hexdigest()
-                    node = {
-                        '@id'           : f"./{entry_folder.name}/{data_filename}",
-                        '@type'         : 'File',
-                        'name'          : data_filename,
-                        'contentSize'   : len(json.dumps(json_data)),
-                        'encodingFormat': 'application/json',
-                        'sha256'        : sha
-                        }
-                    crate_metadata['@graph'].append(node)
-                    files.append(node['@id'])
-            else:
-                logger.warning('Skipping unsupported element type %s', typ)
-
-        crate_path = entry_folder / 'crate-metadata.json'
-        with crate_path.open('w') as cmf:
-            json.dump(crate_metadata, cmf, indent=2)

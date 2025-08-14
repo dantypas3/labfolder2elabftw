@@ -53,31 +53,39 @@ class Importer:
             "extra_fields_groups": []
             })
 
+        groups_def = {
+            1: "Labfolder",
+            2: "ISA-Study"
+            }
+
         ef_payload: Dict[str, Any] = {}
         if extra_fields:
-            for k, v in extra_fields.items():
-                if k == "ISA-Study":
-                    list_value = v if isinstance(v, (list, tuple)) else [v]
-                    list_value = [x for x in list_value if
-                                  x not in (None, "", [])]
-                    if not list_value:
-                        continue
-                    ef_payload[k] = {
-                        "type"       : "items",
-                        "value"      : "" if not list_value else str(v),
-                        "group_id"   : 0,
-                        "description": "",
-                        }
+            for name, value in extra_fields.items():
+                # Determine group and type
+                if name == "ISA-Study":
+                    group_id = 2
+                    field_type = "items"
+                    field_value = value if isinstance(value, list) else [value]
+                elif name == "Project creation date":
+                    group_id = 1
+                    field_type = "date"
+                    field_value = value
                 else:
-                    ef_payload[k] = {
-                        "type"       : "text",
-                        "value"      : "" if v is None else str(v),
-                        "group_id"   : 0,
-                        "description": "",
-                        }
-            groups = set(elab_meta.get("extra_fields_groups", []))
-            groups.add(0)
-            elab_meta["extra_fields_groups"] = sorted(groups)
+                    group_id = 1
+                    field_type = "text"
+                    field_value = value or ""
+                ef_payload[name] = {
+                    "type"       : field_type,
+                    "value"      : field_value,
+                    "group_id"   : group_id,
+                    "description": "",
+                    }
+
+        # Replace/augment groups in elab_meta
+        elab_meta["extra_fields_groups"] = [{
+            "id"  : gid,
+            "name": gname
+            } for gid, gname in groups_def.items()]
 
         new_meta: Dict[str, Any] = {
             "elabftw": elab_meta
@@ -89,24 +97,25 @@ class Importer:
             "body"    : body,
             "category": category,
             "metadata": json.dumps(new_meta),
-            "userid"     : uid
+            "userid"  : uid,
             }
 
         ep.patch(endpoint_id=exp_id, data=payload)
 
-    def upload_file (self, exp_id: str, file_path: Path) -> None:
-        if not exp_id.isdigit():
-            raise ValueError(f"Invalid experiment ID for upload: {exp_id!r}")
 
-        mime_type, _ = mimetypes.guess_type(file_path.as_posix())
-        mime_type = mime_type or "application/octet-stream"
-        with file_path.open("rb") as f:
-            files = {
-                "file": (file_path.name, f, mime_type)
-                }
-            get_fixed("experiments").post(endpoint_id=exp_id,
-                                          sub_endpoint_name="uploads",
-                                          files=files)
+    def upload_file (self, exp_id: str, file_path: Path) -> None:
+            if not exp_id.isdigit():
+                raise ValueError(f"Invalid experiment ID for upload: {exp_id!r}")
+
+            mime_type, _ = mimetypes.guess_type(file_path.as_posix())
+            mime_type = mime_type or "application/octet-stream"
+            with file_path.open("rb") as f:
+                files = {
+                    "file": (file_path.name, f, mime_type)
+                    }
+            (get_fixed("experiments").post(endpoint_id=exp_id,
+                                            sub_endpoint_name="uploads",
+                                            files=files))
 
     def link_resource (self, exp_id: str, resource_id: str) -> None:
         if not exp_id.isdigit():

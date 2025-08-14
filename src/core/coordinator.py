@@ -1,14 +1,18 @@
-from ..labfolder.fetcher import LabFolderFetcher
-from ..transformer import Transformer
-from ..elabftw.importer import Importer
-import logging
 import json
+import logging
+import zipfile  # <- needed for is_zipfile checks
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import pandas as pd
 
-ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+# Adjust imports if your structure is flat (drop the leading dots):
+from ..labfolder.fetcher import LabFolderFetcher
+from ..elabftw.importer import Importer
+from ..transformer import Transformer
+
+
+ROOT_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 COORD_LOG = LOG_DIR / "coordinator.log"
@@ -18,21 +22,20 @@ coord_logger.setLevel(logging.INFO)
 fh = logging.FileHandler(COORD_LOG, mode="a")
 fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 coord_logger.addHandler(fh)
-
-ch = logging.StreamHandler()
-ch.setFormatter(logging.Formatter("Coordinator: %(message)s"))
-coord_logger.addHandler(ch)
+coord_logger.addHandler(logging.StreamHandler())
 
 
 class Coordinator:
-
-    def __init__(self, username: str, password: str,
+    def __init__(self,
+                 username: str,
+                 password: str,
                  url: str = "https://labfolder.labforward.app/api/v2",
                  authors: Optional[List[str]] = None,
                  entries_parquet: Optional[Path] = None,
                  use_parquet: bool = False,
-                 isa_ids : Optional[Path] = None,
-                 namelist : Optional[Path] = None) -> None:
+                 isa_ids: Optional[Path] = None,
+                 namelist: Optional[Path] = None,
+                 xhtml_cache_dir: Path = Path("exports/xhtml")) -> None:
 
         self._client = LabFolderFetcher(username, password, url)
         self._importer = Importer()
@@ -42,12 +45,10 @@ class Coordinator:
         self._use_parquet: bool = bool(use_parquet)
         self._isa_ids = isa_ids
         self._namelist = namelist
+        self._xhtml_cache_dir = xhtml_cache_dir.resolve()
 
+    # ---------- parquet cache helpers ----------
     def _json_cols(self, df: pd.DataFrame) -> List[str]:
-        """
-        Detect columns that contain dict/list values and should be JSON-encoded
-        to make the table parquet-compatible.
-        """
         json_cols: List[str] = []
         for col in df.columns:
             series = df[col]
@@ -73,11 +74,10 @@ class Coordinator:
             if c in decoded.columns:
                 def _maybe_load(v: Any) -> Any:
                     if isinstance(v, str):
-                        v_strip = v.strip()
-                        if (v_strip.startswith("{") and v_strip.endswith("}")) or \
-                           (v_strip.startswith("[") and v_strip.endswith("]")):
+                        t = v.strip()
+                        if (t.startswith("{") and t.endswith("}")) or (t.startswith("[") and t.endswith("]")):
                             try:
-                                return json.loads(v_strip)
+                                return json.loads(t)
                             except Exception:
                                 return v
                     return v
@@ -85,15 +85,11 @@ class Coordinator:
         return decoded
 
     def _save_entries_to_cache(self, entries: List[Dict[str, Any]], path: Path) -> None:
-        """
-        Try to save entries to parquet with JSON-encoded complex columns.
-        If parquet engine or types are unsupported, fall back to .json.gz.
-        """
         try:
             df = pd.DataFrame(entries)
             json_cols = self._json_cols(df)
             enc = self._encode_json_cols(df, json_cols)
-
+            path.parent.mkdir(parents=True, exist_ok=True)
             enc.to_parquet(path, index=False)
             meta_path = path.with_suffix(path.suffix + ".meta.json")
             meta_path.write_text(json.dumps({"json_cols": json_cols}, indent=2))
@@ -109,10 +105,7 @@ class Coordinator:
             self.logger.info("Saved %d entries to JSON.gz: %s", len(entries), gz_path)
 
     def _load_entries_from_cache(self, path: Path) -> List[Dict[str, Any]]:
-        """
-        Load entries from parquet (preferred) or JSON.gz fallback.
-        """
-        if path.exists() and path.suffix == ".parquet":
+        if path and path.exists() and path.suffix == ".parquet":
             try:
                 df = pd.read_parquet(path)
                 meta_path = path.with_suffix(path.suffix + ".meta.json")
@@ -133,9 +126,9 @@ class Coordinator:
 
         import gzip
         gz_candidates: List[Path] = []
-        if path.suffix == ".json.gz":
+        if path and path.suffix == ".json.gz":
             gz_candidates.append(path)
-        else:
+        elif path:
             gz_candidates.append(path.with_suffix(".json.gz"))
 
         for gz_path in gz_candidates:
@@ -155,62 +148,223 @@ class Coordinator:
 
         raise FileNotFoundError(f"No usable cache found for {path}")
 
+    # ---------- XHTML cache & reuse ----------
+    def _prepare_xhtml_root(self,
+                            prefer_local: bool = True,
+                            export_id: Optional[str] = None) -> Optional[Path]:
+        """
+        Return a local folder containing the extracted XHTML export.
+
+        Strategy:
+          1) If prefer_local and a folder 'labfolder_xhtml_*' or 'xhtml_*' exists, reuse newest.
+          2) Else, if a ZIP exists in cache dir, extract it (if valid) and reuse.
+          3) Else, if export_id is given, download once and extract (and validate).
+          4) Else, reuse newest FINISHED export from API; if none, create one.
+        """
+        cache_dir = self._xhtml_cache_dir
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        def _latest_extracted() -> Optional[Path]:
+            patterns = ["labfolder_xhtml_*", "xhtml_*"]
+            candidates: List[Path] = []
+            for pat in patterns:
+                candidates += [p for p in cache_dir.glob(pat) if p.is_dir()]
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return candidates[0] if candidates else None
+
+        def _latest_zip() -> Optional[tuple[str, Path]]:
+            patterns = ["labfolder_xhtml_*.zip", "xhtml_*.zip"]
+            zips: List[Path] = []
+            for pat in patterns:
+                zips += [p for p in cache_dir.glob(pat) if p.is_file()]
+            zips.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            if not zips:
+                return None
+            # derive export_id-ish token from filename
+            name = zips[0].stem  # e.g. labfolder_xhtml_<id> OR xhtml_<id>
+            if "labfolder_xhtml_" in name:
+                token = name.split("labfolder_xhtml_")[-1]
+            elif "xhtml_" in name:
+                token = name.split("xhtml_")[-1]
+            else:
+                token = name
+            return (token, zips[0])
+
+        # 1) Prefer already-extracted
+        if prefer_local:
+            local = _latest_extracted()
+            if local:
+                self.logger.info("Reusing local XHTML export at: %s", local)
+                return local
+
+        # 2) Extract from an existing ZIP if present (validate first)
+        z = _latest_zip()
+        if z:
+            exp_id, zip_path = z
+            if not zip_path.exists():
+                self.logger.warning("ZIP path listed but missing: %s", zip_path)
+            elif not zipfile.is_zipfile(zip_path):
+                self.logger.warning("Cached file is not a valid ZIP, removing: %s", zip_path)
+                try:
+                    zip_path.unlink()
+                except Exception:
+                    pass
+            else:
+                out_dir = cache_dir / f"labfolder_xhtml_{exp_id}"
+                if not out_dir.exists():
+                    self._client.extract_zip(zip_path, out_dir)
+                    self.logger.info("Extracted cached ZIP to: %s", out_dir)
+                return out_dir
+
+        # 3) Use provided export_id once
+        if export_id:
+            zip_path = cache_dir / f"labfolder_xhtml_{export_id}.zip"
+            if not zip_path.exists():
+                self.logger.info("Downloading XHTML export %s to %s", export_id, zip_path)
+                self._client.download_xhtml_export(export_id, zip_path)
+            if not zipfile.is_zipfile(zip_path):
+                self.logger.warning("Downloaded file is not a valid ZIP, removing: %s", zip_path)
+                try:
+                    zip_path.unlink()
+                except Exception:
+                    pass
+                return None
+            out_dir = cache_dir / f"labfolder_xhtml_{export_id}"
+            if not out_dir.exists():
+                self._client.extract_zip(zip_path, out_dir)
+            return out_dir
+
+        # 4) Reuse newest FINISHED from API; else create one time
+        try:
+            finished = self._client.list_xhtml_exports(status="FINISHED", limit=50)
+            if finished:
+                finished.sort(key=lambda e: e.get("creation_date", ""), reverse=True)
+                reuse = finished[0]
+                exp_id = reuse["id"]
+                zip_path = cache_dir / f"labfolder_xhtml_{exp_id}.zip"
+                if not zip_path.exists():
+                    self.logger.info("Reusing FINISHED XHTML export %s; downloading once.", exp_id)
+                    self._client.download_xhtml_export(exp_id, zip_path)
+                if not zipfile.is_zipfile(zip_path):
+                    self.logger.warning("Reused download is not a valid ZIP, removing: %s", zip_path)
+                    try:
+                        zip_path.unlink()
+                    except Exception:
+                        pass
+                    return None
+                out_dir = cache_dir / f"labfolder_xhtml_{exp_id}"
+                if not out_dir.exists():
+                    self._client.extract_zip(zip_path, out_dir)
+                return out_dir
+        except Exception as e:
+            self.logger.warning("Could not reuse FINISHED XHTML export: %s", e)
+
+        try:
+            self.logger.info("Creating XHTML export (one-time)…")
+            new_id = self._client.create_xhtml_export(include_hidden_items=False)
+            self._client.wait_for_xhtml_export(new_id)
+            zip_path = cache_dir / f"labfolder_xhtml_{new_id}.zip"
+            self._client.download_xhtml_export(new_id, zip_path)
+            if not zipfile.is_zipfile(zip_path):
+                self.logger.warning("Newly created download is not a valid ZIP, removing: %s", zip_path)
+                try:
+                    zip_path.unlink()
+                except Exception:
+                    pass
+                return None
+            out_dir = cache_dir / f"labfolder_xhtml_{new_id}"
+            self._client.extract_zip(zip_path, out_dir)
+            return out_dir
+        except Exception as e:
+            self.logger.warning("Skipping XHTML attachments (reason: %s)", e)
+            return None
+
+    def _xhtml_contains_project (self, xhtml_root: Path,
+                                 project_id: str) -> bool:
+        try:
+            projects_root = Path(xhtml_root) / "projects"
+            if not projects_root.exists():
+                return False
+            pid = str(project_id)
+            for grp in projects_root.iterdir():
+                if not grp.is_dir():
+                    continue
+                for cand in grp.iterdir():
+                    if not cand.is_dir():
+                        continue
+                    name = cand.name
+                    if (name.startswith(f"{pid}_") or name.endswith(
+                        f"_{pid}") or f"_{pid}_" in name or name == pid or pid in name
+                    # last resort
+                    ):
+                        return True
+            return False
+        except Exception:
+            return False
+
+    # ---------- main ----------
     def run (self) -> None:
+        """
+        Main entry point:
+          - Load entries (cache or API)
+          - Group by Labfolder project
+          - Ensure the local XHTML cache contains all target projects (refresh once if missing)
+          - Create eLabFTW experiments per project, attach XHTML artifacts + PDFs
+        """
+        # 1) Entries source (cache or API)
         if self._use_parquet:
             if not self._entries_parquet:
-                raise ValueError("--use-parquet requires --entries-parquet to be set to a valid file path")
-            self.logger.info("Loading all entries from cache: %s", self._entries_parquet)
-            entries: List[Dict[str, Any]] = self._load_entries_from_cache(self._entries_parquet)
+                raise ValueError("--use-parquet requires --entries-parquet")
+            self.logger.info("Loading all entries from cache: %s",
+                             self._entries_parquet)
+            entries: List[Dict[str, Any]] = self._load_entries_from_cache(
+                self._entries_parquet)
         else:
             self.logger.info("Fetching all entries from Labfolder…")
             entries: List[Dict[str, Any]] = self._client.fetch_entries(
-                expand=["author", "project", "last_editor"]
-            )
+                expand=["author", "project", "last_editor"])
             self.logger.info("Fetched %d entries", len(entries))
             if self._entries_parquet:
                 try:
                     self._save_entries_to_cache(entries, self._entries_parquet)
                 except Exception as e:
                     self.logger.warning("Failed to save entries cache: %s", e)
-###
-        entry_to_project = {}
-        for entry in entries:
-            entry_id = str(entry.get("Labfolder_ID") or entry.get("id"))
-            project_id = str(
-                entry.get("labfolder_project_id") or entry.get("project_id") or
-                entry["project"]["id"])
-            entry_to_project[entry_id] = project_id
-###
-        transformer = Transformer(entries=entries,
-                                  fetcher=self._client,
-                                  importer=self._importer,
-                                  isa_ids_list=self._isa_ids,
-                                  namelist=self._namelist
-                                  )
 
+        # 2) Build transformer
+        transformer = Transformer(entries=entries, fetcher=self._client,
+            importer=self._importer, isa_ids_list=self._isa_ids,
+            namelist=self._namelist)
+
+        # 3) Group by project (optionally filter by authors)
         if self._authors:
-            self.logger.info("Filtering by authors (first names): %s", ", ".join(self._authors))
-            data_by_project = transformer.transform_experiment_data_filtered(self._authors)
+            self.logger.info("Filtering by authors (first names): %s",
+                             ", ".join(self._authors))
+            data_by_project = transformer.transform_experiment_data_filtered(
+                self._authors)
         else:
-            self.logger.info("Transforming entries into grouped experiment data…")
+            self.logger.info(
+                "Transforming entries into grouped experiment data…")
             data_by_project = transformer.transform_experiment_data()
 
+        # 4) Make sure our local XHTML cache contains all target projects.
+        #    If any are missing from the current cached export, create a fresh export ONCE and reuse it.
+        target_pids = {str(pid) for pid in data_by_project.keys()}
+        try:
+            xhtml_root = self._ensure_xhtml_for_projects(target_pids)
+        except AttributeError:
+            # Backward-compat: if helper isn't present, fall back to the basic one-time preparer.
+            self.logger.warning(
+                "_ensure_xhtml_for_projects not found; using _prepare_xhtml_root instead (may miss some projects).")
+            xhtml_root = self._prepare_xhtml_root(prefer_local=True,
+                                                  export_id=None)
+
+        # 5) Create experiments per project
         for project_id, project_entries in data_by_project.items():
-            self.logger.info(
-                "Importing project %r with %d entries…",
-                project_id, len(project_entries)
-            )
+            self.logger.info("Importing project %r with %d entries…",
+                             project_id, len(project_entries))
             html_blocks = transformer.transform_projects_content(
-                project_entries,
-                category=83
-
-            )
-            self.logger.info(
-                "Finished project %r: %d HTML blocks created",
-                project_id, len(html_blocks)
-            )
-
-if __name__ == "__main__":
-    coord = Coordinator("<USERNAME>", "<PASSWORD>")
-
-    coord.run()
+                project_entries, category=83, xhtml_root=xhtml_root
+                # may be None if XHTML export unavailable
+                )
+            self.logger.info("Finished project %r: %d HTML blocks created",
+                             project_id, len(html_blocks))

@@ -57,6 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--namelist", type=Path, required=False,
                    help="Path to a CSV file for matching labfolder  "
                         "with elab users.")
+    p.add_argument("--only-projects-from-xhtml", action="store_true",
+                   help=("Process ONLY those projects that exist in the local XHTML export cache. "
+                         "Useful when you have exported a subset and want to migrate just that subset."))
     p.add_argument("--debug", action="store_true",
                    help="Enable verbose debug logging (incl. HTTP wire logs).")
     p.add_argument("--log-file", type=Path, default=None,
@@ -81,6 +84,7 @@ def main() -> None:
             use_parquet=args.use_parquet,
             isa_ids = args.isa_ids,
             namelist = args.namelist,
+            restrict_to_xhtml=args.only_projects_from_xhtml,
         )
         log.debug("Coordinator initialized")
         coord.run()

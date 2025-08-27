@@ -1,15 +1,13 @@
 import json
 import logging
-import tempfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Iterable
 
 import numpy as np
 import pandas as pd
 
-# If flat structure, change these to: from importer import Importer / from fetcher import LabFolderFetcher
 from ..elabftw import Importer
 from ..labfolder import LabFolderFetcher
 
@@ -18,7 +16,7 @@ LOG_DIR = ROOT_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 TRANS_LOG_FILE = LOG_DIR / "transformer.log"
-file_handler = logging.FileHandler(str(TRANS_LOG_FILE), mode="a")
+file_handler = logging.FileHandler(str(TRANS_LOG_FILE), mode="a", encoding="utf-8")
 file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 
 transformer_logger = logging.getLogger("Transformer")
@@ -28,15 +26,12 @@ transformer_logger.addHandler(logging.StreamHandler())
 
 
 class Transformer:
-    def __init__(
-        self,
-        entries: List[Dict[str, Any]],
-        fetcher: LabFolderFetcher,
-        importer: Importer,
-        isa_ids_list: Optional[Path] = None,
-        namelist: Optional[Path] = None,
-        logger: Optional[logging.Logger] = None,
-    ) -> None:
+    def __init__(self, entries: List[Dict[str, Any]],
+                 fetcher: LabFolderFetcher,
+                 importer: Importer,
+                 isa_ids_list: Optional[Path] = None,
+                 namelist: Optional[Path] = None,
+                 logger: Optional[logging.Logger] = None) -> None:
 
         self._entries = pd.DataFrame(entries)
         self._namelist = namelist
@@ -50,21 +45,21 @@ class Transformer:
         experiment_data: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
         for _, row in df.iterrows():
             record = {
-                "name": f"{row['author'].get('first_name')} {row['author'].get('last_name')}",
-                "entry_creation_date": row["creation_date"],
-                "elements": row["elements"],
-                "entry_number": row["entry_number"],
-                "entry_id": row["id"],
-                "last_editor_name": f"{row['last_editor'].get('first_name')} {row['last_editor'].get('last_name')}",
-                "tags": row["tags"],
-                "entry_title": row["title"],
-                "last_edited": row["version_date"],
+                "name"                 : f"{row['author'].get('first_name')} {row['author'].get('last_name')}",
+                "entry_creation_date"  : row["creation_date"],
+                "elements"             : row["elements"],
+                "entry_number"         : row["entry_number"],
+                "entry_id"             : row["id"],
+                "last_editor_name"     : f"{row['last_editor'].get('first_name')} {row['last_editor'].get('last_name')}",
+                "tags"                 : row["tags"],
+                "entry_title"          : row["title"],
+                "last_edited"          : row["version_date"],
                 "project_creation_date": row["project"].get("creation_date"),
-                "labfolder_project_id": row["project"].get("id"),
-                "number_of_entries": row["project"].get("number_of_entries"),
-                "project_title": row["project"].get("title"),
-                "project_owner": f"{row['author'].get('first_name')} {row['author'].get('last_name')}",
-                "Labfolder_ID": row["project"].get("id"),
+                "labfolder_project_id" : row["project"].get("id"),
+                "number_of_entries"    : row["project"].get("number_of_entries"),
+                "project_title"        : row["project"].get("title"),
+                "project_owner"        : f"{row['author'].get('first_name')} {row['author'].get('last_name')}",
+                "Labfolder_ID"         : row["project"].get("id"),
             }
             experiment_data[row["project_id"]].append(record)
         return experiment_data
@@ -89,10 +84,10 @@ class Transformer:
         return self._build_experiment_data(filtered)
 
     # ---------- transform / create experiment ----------
-    def transform_projects_content (self, project: List[Dict[str, Any]],
-                                    max_entries: Optional[int] = None,
-                                    category: int = 83,
-                                    xhtml_root: Optional[Path] = None) -> List[str]:
+    def transform_projects_content(self, project: List[Dict[str, Any]],
+                                   max_entries: Optional[int] = None,
+                                   category: int = 83,
+                                   xhtml_root: Optional[Path] = None) -> List[str]:
         title, tags = self.collect_title_and_tags(project)
         exp_id = self._importer.create_experiment(title, tags)
         entry_htmls: List[str] = []
@@ -107,7 +102,9 @@ class Transformer:
 
         extra_fields = self.build_extra_fields(project[0])
         self._importer.patch_experiment(exp_id, full_body, category,
-                                        extra_fields=extra_fields)
+                                        uid=self.match_user_id(project[0]),
+                                        extra_fields=extra_fields,
+                                        )
 
         isa_id = extra_fields.get("ISA-Study")
         if isa_id:
@@ -116,13 +113,11 @@ class Transformer:
             except Exception as e:
                 self.logger.error("Failed to link ISA-Study %s to experiment %s: %s", isa_id, exp_id, e)
 
-        # Attach XHTML project index + all XLSX from cached export
+        # Attach XHTML artifacts & project PDF
         try:
             self._attach_xhtml_artifacts_for_project(exp_id, project, xhtml_root)
         except Exception as e:
             self.logger.error("Failed to attach XHTML artifacts: %s", e)
-
-        # Attach Project PDF (create → wait → download → upload), with caching
         try:
             self._attach_project_pdf(exp_id, project)
         except Exception as e:
@@ -166,7 +161,6 @@ class Transformer:
                 except Exception as e:
                     self.logger.error("TEXT fetch failed for %s: %s", element.get("id"), e)
                     blocks.append(f"<p>[Failed to fetch TEXT: {element.get('id')}]</p>")
-
             elif typ == "FILE":
                 path = self._fetcher.fetch_file(element)
                 if path:
@@ -176,7 +170,6 @@ class Transformer:
                     except Exception as e:
                         self.logger.error("FILE upload failed for %s: %s", path.name, e)
                         blocks.append(f"<p>[Failed to attach FILE: {element.get('id')}]</p>")
-
             elif typ == "IMAGE":
                 path = self._fetcher.fetch_image(element)
                 if path:
@@ -186,7 +179,6 @@ class Transformer:
                     except Exception as e:
                         self.logger.error("IMAGE upload failed for %s: %s", path.name, e)
                         blocks.append(f"<p>[Failed to attach IMAGE: {element.get('id')}]</p>")
-
             elif typ == "DATA":
                 try:
                     data = self._fetcher.fetch_data(element)
@@ -218,19 +210,13 @@ class Transformer:
             '<h5 style="margin:0 0 4px 0;">Labfolder Info</h5>'
             f"Project created: {first_entry.get('project_creation_date')}<br>"
             f"Labfolder project id: {first_entry.get('labfolder_project_id')}<br>"
-            f"Author: {first_entry.get('project_owner')}<br>"
-            f"Last edited: {first_entry.get('last_edited')}<br>"
+            f"Project Author: {first_entry.get('project_owner')}<br>"
+            f"Project Last edited: {first_entry.get('last_edited')}<br>"
             "</div>"
         )
 
     # ---------- extra metadata ----------
-    def match_isa_id(self, first_entry: Dict[str, Any]) -> Optional[int]:
-        """
-        From CSV (User, Study, Resource ID) resolve an internal eLabFTW item id:
-        - try Resource ID as real item id,
-        - else search by Resource ID text,
-        - else by Study name.
-        """
+    def match_isa_id(self, first_entry: Dict[str, Any]):
         if not self._isa_ids_list:
             return None
         try:
@@ -240,20 +226,12 @@ class Transformer:
         if user_df.empty:
             self.logger.error("No user mapping found")
             return None
-
         entry_name = str(first_entry.get("project_owner", "")).strip().lower()
         for _, row in user_df.iterrows():
             csv_name = str(row["User"]).strip().lower()
             if csv_name == entry_name:
-                study = str(row.get("Study", "")).strip() or None
-                code = str(row.get("Resource ID", "")).strip() or None
-                # ask Importer to resolve to real internal item id
-                iid = self._importer.resolve_item_id(code_or_id=code, study_name=study)
-                self.logger.debug("Resolved ISA item for %s (code=%r, study=%r) to %r", entry_name, code, study, iid)
-                if iid is None:
-                    self.logger.warning("Could not resolve ISA item for %s (code=%r, study=%r)", entry_name, code, study)
-                return int(iid)
-        self.logger.warning("No Resource ID row found for %s", entry_name)
+                return row["Resource ID"]
+        self.logger.warning("No Resource ID found for %s", entry_name)
         return None
 
     def match_user_id(self, first_entry: Dict[str, Any]):
@@ -286,38 +264,65 @@ class Transformer:
 
     def build_extra_fields(self, first_entry: Dict[str, Any]) -> Dict[str, Any]:
         return {
-            "Project Owner": first_entry.get("project_owner"),
-            "Project creation date": self._parse_date(first_entry.get("project_creation_date")),
-            "Labfolder Project ID": first_entry.get("Labfolder_ID"),
-            # extra_fields expects items as a list
-            "ISA-Study": self.match_isa_id(first_entry)
+            "Project Author"        : first_entry.get("project_owner"),
+            "Project creation date": self._parse_date(first_entry.get(
+                "project_creation_date")),
+            "Labfolder Project ID" : first_entry.get("Labfolder_ID"),
+            "ISA-Study"            : str(self.match_isa_id(first_entry)),
         }
 
-    # ---------- XHTML attachment logic (unchanged) ----------
-    def _attach_xhtml_artifacts_for_project(self, exp_id: str, project: List[Dict[str, Any]], xhtml_root: Optional[Path]) -> None:
+    # ---------- projects/ root discovery ----------
+    def _iter_projects_roots(self, xhtml_root: Path) -> Iterable[Path]:
+        if not xhtml_root or not Path(xhtml_root).exists():
+            return []
+        direct = xhtml_root / "projects"
+        if direct.is_dir():
+            yield direct
+        for p in xhtml_root.glob("*/projects"):
+            if p.is_dir():
+                yield p
+        for p in xhtml_root.glob("*/*/projects"):
+            if p.is_dir():
+                yield p
+
+    # ---------- XHTML attachment logic ----------
+    def _attach_xhtml_artifacts_for_project(self, exp_id: str, project: List[Dict[str, Any]],
+                                            xhtml_root: Optional[Path]) -> None:
+        """
+        Find the project's folder under any detected 'projects' root and attach:
+          - index.html
+          - all *.xlsx (recursively)
+        """
         if not xhtml_root or not Path(xhtml_root).exists():
             return
+
         project_id = str(project[0].get("labfolder_project_id") or project[0].get("Labfolder_ID") or "").strip()
         if not project_id:
             self.logger.warning("Cannot attach XHTML: missing Labfolder project id")
             return
-        projects_root = Path(xhtml_root) / "projects"
-        if not projects_root.exists():
-            self.logger.warning("XHTML projects folder not found at %s", projects_root)
-            return
+
         matches: List[Path] = []
-        for grp in projects_root.iterdir():
-            if not grp.is_dir():
-                continue
-            for candidate in grp.iterdir():
-                if candidate.is_dir() and candidate.name.startswith(f"{project_id}_"):
-                    matches.append(candidate)
+        for projects_root in self._iter_projects_roots(Path(xhtml_root)):
+            for grp in projects_root.iterdir():
+                if not grp.is_dir():
+                    continue
+                for candidate in grp.iterdir():
+                    if candidate.is_dir() and (
+                        candidate.name.startswith(f"{project_id}_")
+                        or candidate.name == project_id
+                        or candidate.name.endswith(f"_{project_id}")
+                        or f"_{project_id}_" in candidate.name
+                    ):
+                        matches.append(candidate)
+
         if not matches:
-            self.logger.info("No XHTML project folder matched id %s under %s", project_id, projects_root)
+            self.logger.info("No XHTML project folder matched id %s under %s", project_id, xhtml_root)
             return
+
         matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         project_folder = matches[0]
         self.logger.info("Attaching XHTML artifacts from: %s", project_folder)
+
         index_html = project_folder / "index.html"
         if index_html.exists():
             try:
@@ -325,6 +330,7 @@ class Transformer:
                 self.logger.info("Attached XHTML index: %s", index_html.name)
             except Exception as e:
                 self.logger.warning("Failed to attach %s: %s", index_html, e)
+
         for xlsx in project_folder.rglob("*.xlsx"):
             try:
                 self._importer.upload_file(exp_id, xlsx)
@@ -332,7 +338,7 @@ class Transformer:
             except Exception as e:
                 self.logger.warning("Failed to attach %s: %s", xlsx, e)
 
-    # ---------- Project PDF attachment (unchanged) ----------
+    # ---------- Project PDF attachment ----------
     def _attach_project_pdf(self, exp_id: str, project: List[Dict[str, Any]]) -> None:
         project_id = str(project[0].get("labfolder_project_id") or project[0].get("Labfolder_ID") or "").strip()
         project_title = str(project[0].get("project_title") or f"project_{project_id}").strip()

@@ -1,215 +1,194 @@
-import hashlib
-import json
+# src/labfolder/fetcher.py
 import logging
-import mimetypes
 import tempfile
-import uuid
 import time
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from requests import HTTPError
 
-import sys
-from typing import Any, Dict, List, Optional, Tuple
 try:
-    from tqdm import tqdm
-except Exception:  # tqdm optional fallback
-    tqdm = None
+    from tqdm import tqdm  # optional; nice progress bars when running in a TTY
+except Exception:
+    tqdm = None  # fallback silently if tqdm isn't available
 
-
-# If you are not using packages, change to: from client import LabfolderClient
 from .client import LabfolderClient
 
 
+# ---------- logging setup ----------
 ROOT = Path(__file__).resolve().parent
-LOG_DIR = ROOT / 'logs'
+LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / 'labfolder_fetcher.log'
+LOG_FILE = LOG_DIR / "labfolder_fetcher.log"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    handlers=[logging.StreamHandler(), logging.FileHandler(str(LOG_FILE))]
-)
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    logger.addHandler(logging.StreamHandler())
+    fh = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(fh)
 
 
 class LabFolderFetcher:
     """
-    Wraps the Labfolder client to fetch entries and files.
-    Also exposes PDF/XHTML export helpers with robust download & ZIP validation.
+    High-level helper around the Labfolder API:
+      - entries & elements fetching
+      - PDF/XHTML exports (creation, polling, download)
     """
 
     def __init__(self, email: str, password: str, base_url: str) -> None:
-        self.email = email
-        self.password = password
-        self.base_url = base_url.rstrip('/')
+        self.base_url = base_url.rstrip("/")
         self._client = LabfolderClient(email, password, self.base_url)
         self._client.login()
 
-    # ---------------------------
-    # Low-level GET/POST helpers
-    # ---------------------------
+    # -------------------------------------------------------------------------
+    # Low-level HTTP helpers (with transparent re-login on 401)
+    # -------------------------------------------------------------------------
+
     def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
-        """Authenticated GET with 401 refresh."""
         try:
             return self._client.get(endpoint, params=params)
         except HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
-                logger.info('Token expired, re-logging in')
+                logger.info("401 on GET %s — re-authenticating…", endpoint)
                 self._client.login()
                 return self._client.get(endpoint, params=params)
             raise
 
     def _post(self, endpoint: str, json_data: Optional[Dict[str, Any]] = None) -> requests.Response:
-        """Authenticated POST with 401 refresh."""
         url = f"{self.base_url}/{endpoint}"
         resp = self._client._session.post(url, json=json_data or {})  # type: ignore[attr-defined]
         if resp.status_code == 401:
-            logger.info('401 on POST; re-logging in and retrying')
+            logger.info("401 on POST %s — re-authenticating…", endpoint)
             self._client.login()
             resp = self._client._session.post(url, json=json_data or {})  # type: ignore[attr-defined]
         resp.raise_for_status()
         return resp
 
-    # ---------------------------
-    # Entries / elements
-    # ---------------------------
-    def fetch_entries(self, expand: Optional[List[str]] = None,
-                      limit: int = 50, include_hidden: bool = True) -> List[Dict[str, Any]]:
+    # -------------------------------------------------------------------------
+    # Entries & elements
+    # -------------------------------------------------------------------------
+
+    def fetch_entries(
+        self,
+        expand: Optional[List[str]] = None,
+        limit: int = 50,
+        include_hidden: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Fetch all entries, paging until completion."""
         entries: List[Dict[str, Any]] = []
         offset = 0
-        expand_str = ','.join(expand) if expand else None
+        expand_str = ",".join(expand) if expand else None
 
         while True:
             params: Dict[str, Any] = {
-                'limit': limit,
-                'offset': offset,
-                'include_hidden': include_hidden,
+                "limit": limit,
+                "offset": offset,
+                "include_hidden": include_hidden,
             }
             if expand_str:
-                params['expand'] = expand_str
-            resp = self._get('entries', params=params)
+                params["expand"] = expand_str
+
+            resp = self._get("entries", params=params)
             batch = resp.json()
             if not isinstance(batch, list):
-                raise RuntimeError(f'Unexpected entries format: {batch!r}')
+                raise RuntimeError(f"Unexpected entries format: {batch!r}")
+
             entries.extend(batch)
             if len(batch) < limit:
                 break
             offset += limit
+
         return entries
 
     def fetch_text(self, element: Dict[str, Any]) -> str:
         resp = self._get(f"elements/text/{element['id']}")
-        return resp.json().get('content', '')
+        data = resp.json()
+        return data.get("content", "")
 
-    def fetch_file (self, element: Dict[str, Any]) -> Optional[Path]:
-        file_id = element.get('id')
+    def fetch_file(self, element: Dict[str, Any]) -> Optional[Path]:
+        file_id = element.get("id")
         if not file_id:
-            logger.error('Invalid file element (no id) %r', element)
+            logger.error("Invalid FILE element (no id): %r", element)
             return None
+
         try:
             resp = self._get(f"elements/file/{file_id}/download")
         except HTTPError as e:
-            logger.error('Failed to download file %s: %s', file_id, e)
+            logger.error("Download failed for FILE %s: %s", file_id, e)
             return None
 
-        content_disp = resp.headers.get('Content-Disposition', '')
-        filename = 'file.bin'
-        if 'filename=' in content_disp:
-            parts = content_disp.split('filename=')
-            if len(parts) > 1:
-                filename = parts[-1].strip().strip('"')
+        filename = "file.bin"
+        cd = resp.headers.get("Content-Disposition", "")
+        if "filename=" in cd:
+            filename = cd.split("filename=", 1)[-1].strip().strip('"')
 
-        temp_path = Path(tempfile.gettempdir()) / filename
-        try:
-            self._download_with_progress(resp, temp_path,
-                                         desc=f"FILE {filename}")
-            return temp_path
-        except Exception as e:
-            logger.error('Error writing file %s: %s', temp_path, e)
-            return None
+        dest = Path(tempfile.gettempdir()) / filename
+        return self._stream_to_file(resp, dest, desc=f"FILE {filename}")
 
     def fetch_image(self, element: Dict[str, Any]) -> Optional[Path]:
-        image_id = element.get('id')
+        image_id = element.get("id")
         if not image_id:
-            logger.error('Invalid image element (no id) %r', element)
+            logger.error("Invalid IMAGE element (no id): %r", element)
             return None
+
         try:
             resp = self._get(f"elements/image/{image_id}/original-data")
         except HTTPError as e:
-            logger.error('Failed to download image %s: %s', image_id, e)
+            logger.error("Download failed for IMAGE %s: %s", image_id, e)
             return None
 
-        content_disp = resp.headers.get('Content-Disposition', '')
-        filename = 'unnamed_image'
-        if 'filename=' in content_disp:
-            parts = content_disp.split('filename=')
-            if len(parts) > 1:
-                filename = parts[-1].strip().strip('"')
+        filename = "image"
+        cd = resp.headers.get("Content-Disposition", "")
+        if "filename=" in cd:
+            filename = cd.split("filename=", 1)[-1].strip().strip('"')
 
-        tmp_dir = Path(tempfile.gettempdir())
-        temp_path = tmp_dir / filename
-        try:
-            with temp_path.open('wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        except (OSError, requests.exceptions.RequestException) as e:
-            logger.error('Error writing image file %s: %s', temp_path, e)
-            return None
-        return temp_path
+        dest = Path(tempfile.gettempdir()) / filename
+        return self._stream_to_file(resp, dest, desc=f"IMAGE {filename}")
 
     def fetch_data(self, element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        data_id = element.get('id')
+        data_id = element.get("id")
         if not data_id:
-            logger.error('Invalid data element (no id): %r', element)
+            logger.error("Invalid DATA element (no id): %r", element)
             return None
         try:
             resp = self._get(f"elements/data/{data_id}")
             return resp.json()
         except HTTPError as e:
-            logger.error('Failed to fetch data element %s: %s', data_id, e)
-            return None
-        except ValueError as e:
-            logger.error('Invalid JSON for data element %s: %s', data_id, e)
+            logger.error("Failed to fetch DATA %s: %s", data_id, e)
             return None
 
     def fetch_table(self, element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        table_id = element.get('id')
+        table_id = element.get("id")
         if not table_id:
-            logger.error('Invalid table element (no id): %r', element)
+            logger.error("Invalid TABLE element (no id): %r", element)
             return None
         try:
             resp = self._get(f"elements/table/{table_id}")
             return resp.json()
         except HTTPError as e:
-            logger.error('Failed to fetch table element %s: %s', table_id, e)
-            return None
-        except ValueError as e:
-            logger.error('Invalid JSON for table element %s: %s', table_id, e)
+            logger.error("Failed to fetch TABLE %s: %s", table_id, e)
             return None
 
     def fetch_well_plate(self, element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        plate_id = element.get('id')
+        plate_id = element.get("id")
         if not plate_id:
-            logger.error('Invalid well plate element (no id): %r', element)
+            logger.error("Invalid WELL_PLATE element (no id): %r", element)
             return None
         try:
             resp = self._get(f"elements/well-plate/{plate_id}")
             return resp.json()
         except HTTPError as e:
-            logger.error('Failed to fetch well plate %s: %s', plate_id, e)
-            return None
-        except ValueError as e:
-            logger.error('Invalid JSON for well plate %s: %s', plate_id, e)
+            logger.error("Failed to fetch WELL_PLATE %s: %s", plate_id, e)
             return None
 
-    # ---------------------------------------------------------------------
-    # PDF export API (optional)
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # PDF Exports (Labfolder)
+    # -------------------------------------------------------------------------
+
     def create_pdf_export(
         self,
         project_ids: List[str],
@@ -218,6 +197,10 @@ class LabFolderFetcher:
         preserve_entry_layout: bool = True,
         include_hidden_items: bool = False,
     ) -> str:
+        """
+        Ask Labfolder to create a PDF export for the given projects.
+        Returns the export id (we pick the newest export afterwards).
+        """
         payload = {
             "download_filename": download_filename,
             "settings": {"preserve_entry_layout": bool(preserve_entry_layout)},
@@ -230,9 +213,11 @@ class LabFolderFetcher:
             "include_hidden_items": bool(include_hidden_items),
         }
         self._post("exports/pdf", json_data=payload)
+
         exports = self.list_pdf_exports(status="NEW,RUNNING,QUEUED,FINISHED", limit=50)
         if not exports:
-            raise RuntimeError("PDF export creation returned no exports")
+            raise RuntimeError("PDF export creation returned no export objects")
+
         exports.sort(key=lambda e: e.get("creation_date", ""), reverse=True)
         return exports[0]["id"]
 
@@ -248,88 +233,85 @@ class LabFolderFetcher:
         resp = self._get(f"exports/pdf/{export_id}")
         return resp.json()
 
-    def wait_for_pdf_export(self, export_id: str, poll_seconds: int = 3, timeout: int = 900) -> None:
+    def wait_for_pdf_export(self, export_id: str, poll_seconds: int = 3, timeout: int = 1800) -> None:
+        """
+        Poll a PDF export until it is FINISHED or ERROR.
+        If it fails, raise with the most useful details Labfolder returns.
+        """
         deadline = time.time() + timeout
+        last_status = ""
         while time.time() < deadline:
             info = self.get_pdf_export(export_id)
             status = (info.get("status") or "").upper()
+
+            if status != last_status:
+                logger.info("PDF export %s status: %s", export_id, status)
+                last_status = status
+
             if status == "FINISHED":
                 return
             if status in {"ERROR", "REMOVED", "ABORT_PARALLEL"}:
-                raise RuntimeError(f"PDF export {export_id} failed with status {status}")
+                # Surface any error-like fields we can find
+                details = {k: v for k, v in info.items()
+                           if k in ("error", "errorMessage", "message", "statusMessage", "download_filename") and v}
+                raise RuntimeError(f"PDF export {export_id} failed with status {status} and details {details}")
+
             time.sleep(poll_seconds)
+
         raise TimeoutError(f"Timed out waiting for PDF export {export_id}")
 
-    def download_pdf_export (self, export_id: str, dest_path: Path) -> Path:
+    def download_pdf_export(self, export_id: str, dest_path: Path) -> Path:
+        """
+        Download a FINISHED PDF export to dest_path.
+        """
         url = f"{self.base_url}/exports/pdf/{export_id}/download"
-        resp = self._client._session.get(url, stream=True,
-                                         allow_redirects=True)  # type: ignore[attr-defined]
+        resp = self._client._session.get(url, stream=True, allow_redirects=True)  # type: ignore[attr-defined]
         if resp.status_code == 401:
-            logger.info('401 on PDF download; re-logging in and retrying')
+            logger.info("401 on PDF download — re-authenticating…")
             self._client.login()
-            resp = self._client._session.get(url, stream=True,
-                                             allow_redirects=True)  # type: ignore[attr-defined]
+            resp = self._client._session.get(url, stream=True, allow_redirects=True)  # type: ignore[attr-defined]
         resp.raise_for_status()
-        return self._download_with_progress(resp, dest_path,
-                                            desc="Project PDF")
+        return self._stream_to_file(resp, dest_path, desc="Project PDF")
 
-    def wait_for_xhtml_export (self, export_id: str, poll_seconds: int = 10,
-                               timeout: int = 7200) -> None:
-        deadline = time.time() + timeout
-        spinner = None
-        if tqdm and sys.stdout.isatty():
-            spinner = tqdm(total=None, desc="Preparing XHTML on server",
-                           bar_format="{desc}: {elapsed}")
-        try:
-            last_status = ""
-            while time.time() < deadline:
-                info = self.get_xhtml_export(export_id)
-                status = (info.get("status") or "").upper()
-                if spinner:
-                    if status != last_status:
-                        spinner.set_description_str(
-                            f"Preparing XHTML on server [{status}]")
-                        last_status = status
-                    spinner.update(0)
-                if status == "FINISHED":
-                    return
-                if status in {"ERROR", "REMOVED", "ABORT_PARALLEL"}:
-                    raise RuntimeError(
-                        f"XHTML export {export_id} failed with status {status}")
-                time.sleep(poll_seconds)
-            raise TimeoutError(
-                f"Timed out waiting for XHTML export {export_id}")
-        finally:
-            if spinner:
-                spinner.close()
+    # -------------------------------------------------------------------------
+    # XHTML Exports (Labfolder)
+    # -------------------------------------------------------------------------
 
-    # ---------------------------------------------------------------------
-    # XHTML export API (global export by Labfolder design)
-    # ---------------------------------------------------------------------
     def create_xhtml_export(self, *, include_hidden_items: bool = False) -> str:
         payload = {"include_hidden_items": bool(include_hidden_items)}
         self._post("exports/xhtml", json_data=payload)
+
         exports = self.list_xhtml_exports(status="NEW,RUNNING,QUEUED,FINISHED", limit=50)
         if not exports:
-            raise RuntimeError("XHTML export creation returned no exports")
+            raise RuntimeError("XHTML export creation returned no export objects")
+
         exports.sort(key=lambda e: e.get("creation_date", ""), reverse=True)
         return exports[0]["id"]
 
-    def list_xhtml_exports(self, status: Optional[str] = None, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"limit": limit, "offset": offset}
-        if status:
-            params["status"] = status
-        resp = self._get("exports/xhtml", params=params)
-        data = resp.json()
-        return data if isinstance(data, list) else []
+    def list_xhtml_exports(self, status: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        exports: List[Dict[str, Any]] = []
+        offset = 0
+
+        while True:
+            params: Dict[str, Any] = {"limit": limit, "offset": offset}
+            if status:
+                params["status"] = status
+            resp = self._get("exports/xhtml", params=params)
+            batch = resp.json()
+            if not isinstance(batch, list):
+                raise RuntimeError(f"Unexpected XHTML exports format: {batch!r}")
+            exports.extend(batch)
+            if len(batch) < limit:
+                break
+            offset += limit
+
+        return exports
 
     def get_xhtml_export(self, export_id: str) -> Dict[str, Any]:
         resp = self._get(f"exports/xhtml/{export_id}")
         return resp.json()
 
-
-    def wait_for_xhtml_export (self, export_id: str, poll_seconds: int = 10,
-                               timeout: int = 7200) -> None:
+    def wait_for_xhtml_export(self, export_id: str, poll_seconds: int = 10, timeout: int = 7200) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
             info = self.get_xhtml_export(export_id)
@@ -337,39 +319,36 @@ class LabFolderFetcher:
             if status == "FINISHED":
                 return
             if status in {"ERROR", "REMOVED", "ABORT_PARALLEL"}:
-                raise RuntimeError(
-                    f"XHTML export {export_id} failed with status {status}")
+                raise RuntimeError(f"XHTML export {export_id} failed with status {status}")
             time.sleep(poll_seconds)
         raise TimeoutError(f"Timed out waiting for XHTML export {export_id}")
 
-    def download_xhtml_export (self, export_id: str, dest_zip: Path) -> Path:
+    def download_xhtml_export(self, export_id: str, dest_zip: Path) -> Path:
         url = f"{self.base_url}/exports/xhtml/{export_id}/download"
-        resp = self._client._session.get(url, stream=True,
-                                         allow_redirects=True)  # type: ignore[attr-defined]
+        resp = self._client._session.get(url, stream=True, allow_redirects=True)  # type: ignore[attr-defined]
         if resp.status_code == 401:
-            logger.info('401 on XHTML download; re-logging in and retrying')
+            logger.info("401 on XHTML download — re-authenticating…")
             self._client.login()
-            resp = self._client._session.get(url, stream=True,
-                                             allow_redirects=True)  # type: ignore[attr-defined]
+            resp = self._client._session.get(url, stream=True, allow_redirects=True)  # type: ignore[attr-defined]
         resp.raise_for_status()
 
-        self._download_with_progress(resp, dest_zip, desc="XHTML export (ZIP)")
+        self._stream_to_file(resp, dest_zip, desc="XHTML (ZIP)")
 
-        # Validate ZIP
+        # Validate ZIP integrity early
         if not zipfile.is_zipfile(dest_zip):
-            ct = resp.headers.get('Content-Type', '')
+            ct = resp.headers.get("Content-Type", "")
             size = dest_zip.stat().st_size if dest_zip.exists() else 0
             try:
                 dest_zip.unlink(missing_ok=True)  # type: ignore[arg-type]
             except Exception:
                 pass
-            raise RuntimeError(
-                f"Downloaded XHTML is not a ZIP (content-type={ct!r}, bytes={size}).")
+            raise RuntimeError(f"Downloaded XHTML is not a ZIP (content-type={ct!r}, bytes={size}).")
+
         return dest_zip
 
     def extract_zip(self, zip_path: Path, out_dir: Path) -> Path:
         """
-        Extract a verified ZIP. If invalid, raise with a clear message.
+        Extract a valid ZIP to out_dir.
         """
         if not zipfile.is_zipfile(zip_path):
             raise RuntimeError(f"Not a valid ZIP: {zip_path}")
@@ -378,11 +357,14 @@ class LabFolderFetcher:
             zf.extractall(out_dir)
         return out_dir
 
-    def _download_with_progress (self, resp, dest_path: Path,
-                                 desc: str) -> Path:
+    # -------------------------------------------------------------------------
+    # Utilities
+    # -------------------------------------------------------------------------
+
+    def _stream_to_file(self, resp: requests.Response, dest_path: Path, *, desc: str) -> Optional[Path]:
         """
-        Stream 'resp' body to 'dest_path' with a tqdm progress bar (if available).
-        Works even when Content-Length is unknown.
+        Stream an HTTP response body to disk with an optional progress bar.
+        Returns the destination path, or None on error.
         """
         total = None
         try:
@@ -393,24 +375,38 @@ class LabFolderFetcher:
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if tqdm and sys.stdout.isatty():
-            bar = tqdm(total=total, unit="B", unit_scale=True,
-                       unit_divisor=1024, desc=desc)
-            try:
+        try:
+            if tqdm and hasattr(tqdm, "__call__"):
+                # Show progress bar only when stdout is a TTY
+                import sys as _sys
+                use_bar = _sys.stdout.isatty()
+            else:
+                use_bar = False
+        except Exception:
+            use_bar = False
+
+        try:
+            if use_bar:
+                bar = tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024, desc=desc)  # type: ignore[misc]
+                try:
+                    with dest_path.open("wb") as f:
+                        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            bar.update(len(chunk))
+                finally:
+                    bar.close()
+            else:
                 with dest_path.open("wb") as f:
                     for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        bar.update(len(chunk))
-            finally:
-                bar.close()
-        else:
-            # Fallback: simple streaming without fancy UI
-            with dest_path.open("wb") as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-        return dest_path
-
-
+                        if chunk:
+                            f.write(chunk)
+            return dest_path
+        except (OSError, requests.RequestException) as e:
+            logger.error("Failed to write %s: %s", dest_path, e)
+            try:
+                dest_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+            except Exception:
+                pass
+            return None

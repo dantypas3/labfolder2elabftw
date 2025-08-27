@@ -1,7 +1,7 @@
 import json
 import mimetypes
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Iterable
 
 from ..utils import get_fixed
 
@@ -9,30 +9,36 @@ from ..utils import get_fixed
 class Importer:
     """
     Wraps eLabFTW’s “experiments” endpoint to create, patch experiments,
-    and upload file attachments.
+    and upload file attachments. Also provides helpers to resolve item ids.
     """
 
-    def create_experiment (self, title: str, tags: List[str]) -> str:
+    # ---------- Experiments CRUD ----------
+
+    def create_experiment(self, title: str, tags: List[str]) -> str:
         resp = get_fixed("experiments").post(data={
             "title": title,
-            "tags" : tags
-            })
+            "tags": tags
+        })
         try:
             body = resp.json()
             exp_id = str(body.get("id", "")).strip()
         except ValueError:
             exp_id = ""
         if not exp_id:
-            location = resp.headers.get("Location", "") or resp.headers.get(
-                "location", "")
+            location = resp.headers.get("Location", "") or resp.headers.get("location", "")
             exp_id = location.rstrip("/").split("/")[-1]
         if not exp_id.isdigit():
             raise RuntimeError(f"Could not parse experiment ID: {exp_id!r}")
         return exp_id
 
-    def patch_experiment (self, exp_id: str, body: str, category: int,
-                          uid: Optional[int] = None, extra_fields: Optional[
-                Dict[str, Any]] = None, ) -> None:
+    def patch_experiment(
+        self,
+        exp_id: str,
+        body: str,
+        category: int,
+        uid: Optional[int] = None,
+        extra_fields: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if not exp_id.isdigit():
             raise ValueError(f"Invalid experiment ID: {exp_id!r}")
 
@@ -49,14 +55,14 @@ class Importer:
             metadata = raw_meta
 
         elab_meta = metadata.get("elabftw", {
-            "display_main_text"  : True,
+            "display_main_text": True,
             "extra_fields_groups": []
-            })
+        })
 
         groups_def = {
             1: "Labfolder",
-            2: "ISA-Study"
-            }
+            2: "ISA-Study",
+        }
 
         ef_payload: Dict[str, Any] = {}
         if extra_fields:
@@ -65,7 +71,7 @@ class Importer:
                 if name == "ISA-Study":
                     group_id = 2
                     field_type = "items"
-                    field_value = value if isinstance(value, list) else [value]
+                    field_value = str(value) if value else ""
                 elif name == "Project creation date":
                     group_id = 1
                     field_type = "date"
@@ -75,42 +81,37 @@ class Importer:
                     field_type = "text"
                     field_value = value or ""
                 ef_payload[name] = {
-                    "type"       : field_type,
-                    "value"      : field_value,
-                    "group_id"   : group_id,
+                    "type": field_type,
+                    "value": field_value,
+                    "group_id": group_id,
                     "description": "",
-                    }
+                }
 
         # Replace/augment groups in elab_meta
-        elab_meta["extra_fields_groups"] = [{
-            "id"  : gid,
-            "name": gname
-            } for gid, gname in groups_def.items()]
+        elab_meta["extra_fields_groups"] = [
+            {"id": gid, "name": gname} for gid, gname in groups_def.items()
+        ]
 
-        new_meta: Dict[str, Any] = {
-            "elabftw": elab_meta
-            }
+        new_meta: Dict[str, Any] = {"elabftw": elab_meta}
         if ef_payload:
             new_meta["extra_fields"] = ef_payload
 
         payload: Dict[str, Any] = {
-            "body"    : body,
+            "body": body,
             "category": category,
             "metadata": json.dumps(new_meta),
-            "userid"  : uid,
-            }
+            "userid": uid,
+        }
 
         ep.patch(endpoint_id=exp_id, data=payload)
 
-
-    def upload_file (self, exp_id: str, file_path: Path) -> None:
+    def upload_file(self, exp_id: str, file_path: Path) -> None:
         if not exp_id.isdigit():
             raise ValueError(f"Invalid experiment ID for upload: {exp_id!r}")
 
         mime_type, _ = mimetypes.guess_type(file_path.as_posix())
         mime_type = mime_type or "application/octet-stream"
 
-        # IMPORTANT: keep the file handle open while posting
         with file_path.open("rb") as f:
             files = {"file": (file_path.name, f, mime_type)}
             get_fixed("experiments").post(
@@ -119,18 +120,135 @@ class Importer:
                 files=files,
             )
 
-    def link_resource (self, exp_id: str, resource_id: str) -> None:
+    def link_resource(self, exp_id: str, resource_id: str) -> None:
         if not exp_id.isdigit():
             raise ValueError(f"Invalid experiment ID for linking: {exp_id!r}")
         if not resource_id or not str(resource_id).isdigit():
-            raise ValueError(
-                f"Invalid resource ID for linking: {resource_id!r}")
+            raise ValueError(f"Invalid resource ID for linking: {resource_id!r}")
 
-        get_fixed("experiments").post(endpoint_id=str(exp_id),
-                                      sub_endpoint_name="items_links",
-                                      sub_endpoint_id=str(resource_id), data={
-                "action": "create"
-                }, )
+        get_fixed("experiments").post(
+            endpoint_id=str(exp_id),
+            sub_endpoint_name="items_links",
+            sub_endpoint_id=str(resource_id),
+            data={"action": "create"},
+        )
+
+    # ---------- Items (resources) helpers ----------
+
+    def _search_items(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Search items (resources) by query string.
+        Uses eLabFTW /api/v2/items with a 'q' / 'search' parameter depending on backend.
+        """
+        ep = get_fixed("resources")
+        # try 'q', then fall back to 'search'
+        for key in ("q", "search"):
+            try:
+                resp = ep.get(params={key: query, "limit": limit})
+                data = resp.json()
+                if isinstance(data, dict) and "items" in data:
+                    return data["items"]  # some instances wrap results
+                if isinstance(data, list):
+                    return data
+            except Exception:
+                continue
+        # last resort: fetch first page and filter client-side
+        try:
+            data = ep.get(params={"limit": limit}).json()
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+        return []
+
+    def _get_item_by_id(self, item_id: int) -> Optional[Dict[str, Any]]:
+        try:
+            resp = get_fixed("resources").get(endpoint_id=str(item_id))
+            obj = resp.json()
+            # sanity: must look like an item
+            if isinstance(obj, dict) and (str(obj.get("id") or "") == str(item_id)):
+                return obj
+        except Exception:
+            pass
+        return None
+
+    def resolve_item_id(
+        self,
+        code_or_id: Optional[str | int] = None,
+        *,
+        study_name: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        Resolve an internal item id from:
+          - a numeric 'code_or_id' (try as real id first),
+          - else by searching using 'code_or_id' as text,
+          - else by 'study_name' (exact/startswith match).
+        Returns the internal eLabFTW item id or None.
+        """
+        # 1) Try direct id
+        if code_or_id is not None:
+            s = str(code_or_id).strip()
+            if s.isdigit():
+                iid = int(s)
+                if self._get_item_by_id(iid):
+                    return iid
+
+        # 2) Search by code_or_id as text
+        if code_or_id:
+            hits = self._search_items(str(code_or_id))
+            iid = self._pick_best_item(hits, wanted_title=study_name, wanted_code=str(code_or_id))
+            if iid is not None:
+                return iid
+
+        # 3) Search by study_name
+        if study_name:
+            hits = self._search_items(str(study_name))
+            iid = self._pick_best_item(hits, wanted_title=study_name)
+            if iid is not None:
+                return iid
+
+        return None
+
+    def _pick_best_item(
+        self,
+        items: Iterable[Dict[str, Any]],
+        *,
+        wanted_title: Optional[str] = None,
+        wanted_code: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        Heuristic: prefer exact title match; else startswith; else first result.
+        Many eLabFTW instances expose 'title' and 'id' on item objects.
+        Some also store custom fields; we ignore those for simplicity.
+        """
+        items = list(items)
+        if not items:
+            return None
+
+        if wanted_title:
+            # exact case-insensitive title match
+            for it in items:
+                t = str(it.get("title", "")).strip().lower()
+                if t == wanted_title.strip().lower():
+                    return int(it.get("id"))
+            # startswith match
+            for it in items:
+                t = str(it.get("title", "")).strip().lower()
+                if t.startswith(wanted_title.strip().lower()):
+                    return int(it.get("id"))
+
+        # fallback: if we searched with a code, prefer any title containing it
+        if wanted_code:
+            for it in items:
+                t = str(it.get("title", "")).lower()
+                if wanted_code.lower() in t:
+                    return int(it.get("id"))
+
+        # last resort: take the first hit
+        try:
+            return int(items[0].get("id"))
+        except Exception:
+            return None
 
 
 __all__ = ["Importer"]

@@ -1,12 +1,11 @@
 import json
 import logging
-import zipfile  # <- needed for is_zipfile checks
+import zipfile
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Iterable
 
 import pandas as pd
 
-# Adjust imports if your structure is flat (drop the leading dots):
 from ..labfolder.fetcher import LabFolderFetcher
 from ..elabftw.importer import Importer
 from ..transformer import Transformer
@@ -19,7 +18,7 @@ COORD_LOG = LOG_DIR / "coordinator.log"
 
 coord_logger = logging.getLogger("Coordinator")
 coord_logger.setLevel(logging.INFO)
-fh = logging.FileHandler(COORD_LOG, mode="a")
+fh = logging.FileHandler(COORD_LOG, mode="a", encoding="utf-8")
 fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 coord_logger.addHandler(fh)
 coord_logger.addHandler(logging.StreamHandler())
@@ -35,7 +34,8 @@ class Coordinator:
                  use_parquet: bool = False,
                  isa_ids: Optional[Path] = None,
                  namelist: Optional[Path] = None,
-                 xhtml_cache_dir: Path = Path("exports/xhtml")) -> None:
+                 xhtml_cache_dir: Path = Path("exports/xhtml"),
+                 restrict_to_xhtml: bool = False) -> None:
 
         self._client = LabFolderFetcher(username, password, url)
         self._importer = Importer()
@@ -46,6 +46,7 @@ class Coordinator:
         self._isa_ids = isa_ids
         self._namelist = namelist
         self._xhtml_cache_dir = xhtml_cache_dir.resolve()
+        self._restrict_to_xhtml = bool(restrict_to_xhtml)
 
     # ---------- parquet cache helpers ----------
     def _json_cols(self, df: pd.DataFrame) -> List[str]:
@@ -154,7 +155,6 @@ class Coordinator:
                             export_id: Optional[str] = None) -> Optional[Path]:
         """
         Return a local folder containing the extracted XHTML export.
-
         Strategy:
           1) If prefer_local and a folder 'labfolder_xhtml_*' or 'xhtml_*' exists, reuse newest.
           2) Else, if a ZIP exists in cache dir, extract it (if valid) and reuse.
@@ -181,7 +181,7 @@ class Coordinator:
             if not zips:
                 return None
             # derive export_id-ish token from filename
-            name = zips[0].stem  # e.g. labfolder_xhtml_<id> OR xhtml_<id>
+            name = zips[0].stem
             if "labfolder_xhtml_" in name:
                 token = name.split("labfolder_xhtml_")[-1]
             elif "xhtml_" in name:
@@ -279,46 +279,83 @@ class Coordinator:
             self.logger.warning("Skipping XHTML attachments (reason: %s)", e)
             return None
 
-    def _xhtml_contains_project (self, xhtml_root: Path,
-                                 project_id: str) -> bool:
+    # ---------- helpers to handle nested 'projects/' roots ----------
+    def _iter_projects_roots(self, xhtml_root: Path) -> Iterable[Path]:
+        """
+        Yield plausible 'projects' roots:
+        - <root>/projects
+        - any '<root>/*/projects'
+        - any deeper '<root>/**/projects' (depth limited to avoid crawling huge trees)
+        """
+        if not xhtml_root or not xhtml_root.exists():
+            return []
+        direct = xhtml_root / "projects"
+        if direct.is_dir():
+            yield direct
+        # common structure: <root>/<username>/projects
+        for p in xhtml_root.glob("*/projects"):
+            if p.is_dir():
+                yield p
+        # slightly deeper (e.g., <root>/*/*/projects). Limit depth to 3 to be safe.
+        for p in xhtml_root.glob("*/*/projects"):
+            if p.is_dir():
+                yield p
+
+    def _xhtml_contains_project(self, xhtml_root: Path, project_id: str) -> bool:
+        pid = str(project_id)
         try:
-            projects_root = Path(xhtml_root) / "projects"
-            if not projects_root.exists():
-                return False
-            pid = str(project_id)
-            for grp in projects_root.iterdir():
-                if not grp.is_dir():
-                    continue
-                for cand in grp.iterdir():
-                    if not cand.is_dir():
+            for projects_root in self._iter_projects_roots(xhtml_root):
+                for grp in projects_root.iterdir():
+                    if not grp.is_dir():
                         continue
-                    name = cand.name
-                    if (name.startswith(f"{pid}_") or name.endswith(
-                        f"_{pid}") or f"_{pid}_" in name or name == pid or pid in name
-                    # last resort
-                    ):
-                        return True
+                    for cand in grp.iterdir():
+                        if not cand.is_dir():
+                            continue
+                        name = cand.name
+                        if (name.startswith(f"{pid}_")
+                                or name.endswith(f"_{pid}")
+                                or f"_{pid}_" in name
+                                or name == pid):
+                            return True
             return False
         except Exception:
             return False
 
+    def _ensure_xhtml_for_projects(self, target_pids: Set[str]) -> Optional[Path]:
+        root = self._prepare_xhtml_root(prefer_local=True, export_id=None)
+        if not target_pids:
+            return root
+
+        def missing_from(r: Optional[Path]) -> List[str]:
+            if not r or not r.exists():
+                return list(target_pids)
+            return [pid for pid in target_pids if not self._xhtml_contains_project(r, pid)]
+
+        missing = missing_from(root)
+        if missing:
+            self.logger.info("Current XHTML cache missing %d project(s): %s",
+                             len(missing), ", ".join(missing[:24]) + ("…" if len(missing) > 24 else ""))
+            # Refresh once
+            new_root = self._prepare_xhtml_root(prefer_local=False, export_id=None)
+            if new_root:
+                root = new_root
+                still_missing = missing_from(root)
+                if still_missing:
+                    self.logger.warning(
+                        "Even the refreshed XHTML export is missing %d project(s). "
+                        "They will be skipped if --only-projects-from-xhtml is set.",
+                        len(still_missing)
+                    )
+        return root
+
     # ---------- main ----------
-    def run (self) -> None:
-        """
-        Main entry point:
-          - Load entries (cache or API)
-          - Group by Labfolder project
-          - Ensure the local XHTML cache contains all target projects (refresh once if missing)
-          - Create eLabFTW experiments per project, attach XHTML artifacts + PDFs
-        """
-        # 1) Entries source (cache or API)
+    def run(self) -> None:
+        # 1) Entries source
         if self._use_parquet:
             if not self._entries_parquet:
                 raise ValueError("--use-parquet requires --entries-parquet")
-            self.logger.info("Loading all entries from cache: %s",
-                             self._entries_parquet)
-            entries: List[Dict[str, Any]] = self._load_entries_from_cache(
-                self._entries_parquet)
+            self.logger.info("Loading all entries from cache: %s", self._entries_parquet)
+            entries: List[Dict[str, Any]] = self._load_entries_from_cache(self._entries_parquet)
         else:
             self.logger.info("Fetching all entries from Labfolder…")
             entries: List[Dict[str, Any]] = self._client.fetch_entries(
@@ -331,40 +368,49 @@ class Coordinator:
                     self.logger.warning("Failed to save entries cache: %s", e)
 
         # 2) Build transformer
-        transformer = Transformer(entries=entries, fetcher=self._client,
-            importer=self._importer, isa_ids_list=self._isa_ids,
-            namelist=self._namelist)
+        transformer = Transformer(
+            entries=entries,
+            fetcher=self._client,
+            importer=self._importer,
+            isa_ids_list=self._isa_ids,
+            namelist=self._namelist
+        )
 
-        # 3) Group by project (optionally filter by authors)
+        # 3) Group by project (optional author filter)
         if self._authors:
-            self.logger.info("Filtering by authors (first names): %s",
-                             ", ".join(self._authors))
-            data_by_project = transformer.transform_experiment_data_filtered(
-                self._authors)
+            self.logger.info("Filtering by authors (first names): %s", ", ".join(self._authors))
+            data_by_project = transformer.transform_experiment_data_filtered(self._authors)
         else:
-            self.logger.info(
-                "Transforming entries into grouped experiment data…")
+            self.logger.info("Transforming entries into grouped experiment data…")
             data_by_project = transformer.transform_experiment_data()
 
-        # 4) Make sure our local XHTML cache contains all target projects.
-        #    If any are missing from the current cached export, create a fresh export ONCE and reuse it.
+        # 4) Ensure XHTML cache and detect nested 'projects'
         target_pids = {str(pid) for pid in data_by_project.keys()}
-        try:
-            xhtml_root = self._ensure_xhtml_for_projects(target_pids)
-        except AttributeError:
-            # Backward-compat: if helper isn't present, fall back to the basic one-time preparer.
-            self.logger.warning(
-                "_ensure_xhtml_for_projects not found; using _prepare_xhtml_root instead (may miss some projects).")
-            xhtml_root = self._prepare_xhtml_root(prefer_local=True,
-                                                  export_id=None)
+        xhtml_root = self._ensure_xhtml_for_projects(target_pids)
 
-        # 5) Create experiments per project
+        # 5) Optionally restrict to projects present in XHTML
+        if self._restrict_to_xhtml:
+            if not xhtml_root or not xhtml_root.exists():
+                self.logger.error("--only-projects-from-xhtml is set but no XHTML cache is available. Nothing to process.")
+                data_by_project = {}
+            else:
+                kept = {}
+                skipped: List[str] = []
+                for pid, entries_list in data_by_project.items():
+                    if self._xhtml_contains_project(xhtml_root, str(pid)):
+                        kept[pid] = entries_list
+                    else:
+                        skipped.append(str(pid))
+                self.logger.info("Restricting to XHTML projects: keeping %d, skipping %d.", len(kept), len(skipped))
+                if skipped:
+                    self.logger.info("Skipped project IDs (absent in XHTML): %s",
+                                     ", ".join(skipped[:24]) + ("…" if len(skipped) > 24 else ""))
+                data_by_project = kept
+
+        # 6) Create experiments per project
         for project_id, project_entries in data_by_project.items():
-            self.logger.info("Importing project %r with %d entries…",
-                             project_id, len(project_entries))
+            self.logger.info("Importing project %r with %d entries…", project_id, len(project_entries))
             html_blocks = transformer.transform_projects_content(
                 project_entries, category=83, xhtml_root=xhtml_root
-                # may be None if XHTML export unavailable
-                )
-            self.logger.info("Finished project %r: %d HTML blocks created",
-                             project_id, len(html_blocks))
+            )
+            self.logger.info("Finished project %r: %d HTML blocks created", project_id, len(html_blocks))

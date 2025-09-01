@@ -292,11 +292,20 @@ class Coordinator:
         direct = xhtml_root / "projects"
         if direct.is_dir():
             yield direct
-        # recursively find deeper 'projects' dirs
-        for p in xhtml_root.rglob("projects"):
-            if p.is_dir() and p != direct:
-                yield p
 
+        patterns = [
+            "*/projects",         # depth 1
+            "*/*/projects",       # depth 2
+            "*/*/*/projects",     # depth 3
+            "*/*/*/*/projects",   # depth 4
+            "*/*/*/*/*/projects", # depth 5
+        ]
+
+        # recursively find deeper 'projects' dirs
+        for pattern in patterns:
+            for p in xhtml_root.glob(pattern):
+                if p.is_dir():
+                    yield p
     def _xhtml_contains_project(self, xhtml_root: Path, project_id: str) -> bool:
         pid = str(project_id)
         try:

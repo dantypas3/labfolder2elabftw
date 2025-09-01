@@ -28,7 +28,7 @@ class Coordinator:
     def __init__(self,
                  username: str,
                  password: str,
-                 url: str = "https://labfolder.labforward.app/api/v2",
+                 url: str = "https://eln.labfolder.com/api/v2",
                  authors: Optional[List[str]] = None,
                  entries_parquet: Optional[Path] = None,
                  use_parquet: bool = False,
@@ -155,11 +155,13 @@ class Coordinator:
                             export_id: Optional[str] = None) -> Optional[Path]:
         """
         Return a local folder containing the extracted XHTML export.
-        Strategy:
-          1) If prefer_local and a folder 'labfolder_xhtml_*' or 'xhtml_*' exists, reuse newest.
-          2) Else, if a ZIP exists in cache dir, extract it (if valid) and reuse.
-          3) Else, if export_id is given, download once and extract (and validate).
-          4) Else, reuse newest FINISHED export from API; if none, create one.
+
+        IMPORTANT CHANGE:
+        - If restrict_to_xhtml == False: we only reuse an already-extracted local cache
+          or a cached ZIP. We DO NOT call the API (no create/list/wait/download),
+          so the app will not hang here. If nothing local is found, we return None.
+        - If restrict_to_xhtml == True: we keep the original behavior and may talk
+          to the API to ensure the XHTML is available.
         """
         cache_dir = self._xhtml_cache_dir
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -180,7 +182,6 @@ class Coordinator:
             zips.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             if not zips:
                 return None
-            # derive export_id-ish token from filename
             name = zips[0].stem
             if "labfolder_xhtml_" in name:
                 token = name.split("labfolder_xhtml_")[-1]
@@ -191,19 +192,16 @@ class Coordinator:
             return (token, zips[0])
 
         # 1) Prefer already-extracted
-        if prefer_local:
-            local = _latest_extracted()
-            if local:
-                self.logger.info("Reusing local XHTML export at: %s", local)
-                return local
+        local = _latest_extracted()
+        if local:
+            self.logger.info("Reusing local XHTML export at: %s", local)
+            return local
 
         # 2) Extract from an existing ZIP if present (validate first)
         z = _latest_zip()
         if z:
             exp_id, zip_path = z
-            if not zip_path.exists():
-                self.logger.warning("ZIP path listed but missing: %s", zip_path)
-            elif not zipfile.is_zipfile(zip_path):
+            if not zipfile.is_zipfile(zip_path):
                 self.logger.warning("Cached file is not a valid ZIP, removing: %s", zip_path)
                 try:
                     zip_path.unlink()
@@ -215,6 +213,14 @@ class Coordinator:
                     self._client.extract_zip(zip_path, out_dir)
                     self.logger.info("Extracted cached ZIP to: %s", out_dir)
                 return out_dir
+
+        # From here on, only proceed with network calls if restriction was requested.
+        if not self._restrict_to_xhtml:
+            self.logger.info(
+                "No local XHTML cache found and --only-projects-from-xhtml is not set. "
+                "Skipping XHTML preparation."
+            )
+            return None
 
         # 3) Use provided export_id once
         if export_id:
@@ -281,51 +287,48 @@ class Coordinator:
 
     # ---------- helpers to handle nested 'projects/' roots ----------
     def _iter_projects_roots(self, xhtml_root: Path) -> Iterable[Path]:
-        """
-        Yield plausible 'projects' roots:
-        - <root>/projects
-        - any '<root>/*/projects'
-        - any deeper '<root>/**/projects' (depth limited to avoid crawling huge trees)
-        """
         if not xhtml_root or not xhtml_root.exists():
             return []
         direct = xhtml_root / "projects"
         if direct.is_dir():
             yield direct
-        # common structure: <root>/<username>/projects
-        for p in xhtml_root.glob("*/projects"):
-            if p.is_dir():
-                yield p
-        # slightly deeper (e.g., <root>/*/*/projects). Limit depth to 3 to be safe.
-        for p in xhtml_root.glob("*/*/projects"):
-            if p.is_dir():
+        # recursively find deeper 'projects' dirs
+        for p in xhtml_root.rglob("projects"):
+            if p.is_dir() and p != direct:
                 yield p
 
     def _xhtml_contains_project(self, xhtml_root: Path, project_id: str) -> bool:
         pid = str(project_id)
         try:
             for projects_root in self._iter_projects_roots(xhtml_root):
-                for grp in projects_root.iterdir():
-                    if not grp.is_dir():
-                        continue
-                    for cand in grp.iterdir():
-                        if not cand.is_dir():
-                            continue
-                        name = cand.name
-                        if (name.startswith(f"{pid}_")
-                                or name.endswith(f"_{pid}")
-                                or f"_{pid}_" in name
-                                or name == pid):
-                            return True
+                for index_html in projects_root.rglob("index.html"):
+                    name = index_html.parent.name
+                    if (name.startswith(f"{pid}_")
+                            or name.endswith(f"_{pid}")
+                            or f"_{pid}_" in name
+                            or name == pid):
+                        return True
             return False
         except Exception:
             return False
 
     def _ensure_xhtml_for_projects(self, target_pids: Set[str]) -> Optional[Path]:
+        """
+        NEW behavior summary:
+        - If restrict_to_xhtml is False: only return a local XHTML root if present.
+          Do not hit the network.
+        - If restrict_to_xhtml is True: reuse/download/create as before.
+        """
         root = self._prepare_xhtml_root(prefer_local=True, export_id=None)
-        if not target_pids:
+
+        if not self._restrict_to_xhtml:
+            if root:
+                self.logger.info("Using local XHTML at %s for attachments (optional).", root)
+            else:
+                self.logger.info("No local XHTML found; proceeding without XHTML attachments.")
             return root
 
+        # Only reach here if restrict_to_xhtml is True (enforce presence)
         def missing_from(r: Optional[Path]) -> List[str]:
             if not r or not r.exists():
                 return list(target_pids)
@@ -335,7 +338,7 @@ class Coordinator:
         if missing:
             self.logger.info("Current XHTML cache missing %d project(s): %s",
                              len(missing), ", ".join(missing[:24]) + ("…" if len(missing) > 24 else ""))
-            # Refresh once
+            # Refresh once (allowed to call API in this mode)
             new_root = self._prepare_xhtml_root(prefer_local=False, export_id=None)
             if new_root:
                 root = new_root
@@ -343,7 +346,7 @@ class Coordinator:
                 if still_missing:
                     self.logger.warning(
                         "Even the refreshed XHTML export is missing %d project(s). "
-                        "They will be skipped if --only-projects-from-xhtml is set.",
+                        "They will be skipped because --only-projects-from-xhtml is set.",
                         len(still_missing)
                     )
         return root
@@ -384,7 +387,7 @@ class Coordinator:
             self.logger.info("Transforming entries into grouped experiment data…")
             data_by_project = transformer.transform_experiment_data()
 
-        # 4) Ensure XHTML cache and detect nested 'projects'
+        # 4) Ensure XHTML cache (non-blocking when restrict_to_xhtml is False)
         target_pids = {str(pid) for pid in data_by_project.keys()}
         xhtml_root = self._ensure_xhtml_for_projects(target_pids)
 

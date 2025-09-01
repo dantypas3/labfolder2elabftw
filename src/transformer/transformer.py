@@ -39,7 +39,6 @@ class Transformer:
         self._fetcher = fetcher
         self._importer = importer
         self.logger = logger or logging.getLogger(self.__class__.__name__)
-
     # ---------- grouping ----------
     def _build_experiment_data(self, df: pd.DataFrame) -> Dict[Any, List[Dict[str, Any]]]:
         experiment_data: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
@@ -118,10 +117,12 @@ class Transformer:
             self._attach_xhtml_artifacts_for_project(exp_id, project, xhtml_root)
         except Exception as e:
             self.logger.error("Failed to attach XHTML artifacts: %s", e)
-        try:
-            self._attach_project_pdf(exp_id, project)
-        except Exception as e:
-            self.logger.error("Failed to attach Project PDF: %s", e)
+
+        ###DEACTIVATE PDF###
+        # try:
+        #     self._attach_project_pdf(exp_id, project)
+        # except Exception as e:
+        #     self.logger.error("Failed to attach Project PDF: %s", e)
 
         return entry_htmls
 
@@ -273,17 +274,26 @@ class Transformer:
 
     # ---------- projects/ root discovery ----------
     def _iter_projects_roots(self, xhtml_root: Path) -> Iterable[Path]:
+        """
+        Yield plausible 'projects' roots beneath the XHTML export.
+
+        The function now searches recursively for any directory named
+        'projects' anywhere below the provided xhtml_root.  It yields the
+        immediate <root>/projects first (if present), then any deeper matches.
+        """
         if not xhtml_root or not Path(xhtml_root).exists():
             return []
+        xhtml_root = Path(xhtml_root)
         direct = xhtml_root / "projects"
         if direct.is_dir():
             yield direct
-        for p in xhtml_root.glob("*/projects"):
-            if p.is_dir():
-                yield p
-        for p in xhtml_root.glob("*/*/projects"):
-            if p.is_dir():
-                yield p
+        try:
+            for p in xhtml_root.rglob("projects"):
+                if p.is_dir() and p != direct:
+                    yield p
+        except Exception:
+            return []
+
 
     # ---------- XHTML attachment logic ----------
     def _attach_xhtml_artifacts_for_project(self, exp_id: str, project: List[Dict[str, Any]],
@@ -291,7 +301,7 @@ class Transformer:
         """
         Find the project's folder under any detected 'projects' root and attach:
           - index.html
-          - all *.xlsx (recursively)
+          - all *.xlsx files (recursively)
         """
         if not xhtml_root or not Path(xhtml_root).exists():
             return
@@ -302,27 +312,32 @@ class Transformer:
             return
 
         matches: List[Path] = []
+        # Search all index.html files under any 'projects' root and match the enclosing folder name
         for projects_root in self._iter_projects_roots(Path(xhtml_root)):
-            for grp in projects_root.iterdir():
-                if not grp.is_dir():
-                    continue
-                for candidate in grp.iterdir():
-                    if candidate.is_dir() and (
-                        candidate.name.startswith(f"{project_id}_")
-                        or candidate.name == project_id
-                        or candidate.name.endswith(f"_{project_id}")
-                        or f"_{project_id}_" in candidate.name
+            try:
+                for index_path in projects_root.rglob("index.html"):
+                    candidate = index_path.parent
+                    name = candidate.name
+                    if (
+                        name == project_id
+                        or name.startswith(f"{project_id}_")
+                        or name.endswith(f"_{project_id}")
+                        or f"_{project_id}_" in name
                     ):
                         matches.append(candidate)
+            except Exception:
+                continue
 
         if not matches:
             self.logger.info("No XHTML project folder matched id %s under %s", project_id, xhtml_root)
             return
 
+        # Prefer the most recently modified folder
         matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         project_folder = matches[0]
         self.logger.info("Attaching XHTML artifacts from: %s", project_folder)
 
+        # Attach index.html
         index_html = project_folder / "index.html"
         if index_html.exists():
             try:
@@ -331,6 +346,7 @@ class Transformer:
             except Exception as e:
                 self.logger.warning("Failed to attach %s: %s", index_html, e)
 
+        # Attach all .xlsx files under this project folder
         for xlsx in project_folder.rglob("*.xlsx"):
             try:
                 self._importer.upload_file(exp_id, xlsx)

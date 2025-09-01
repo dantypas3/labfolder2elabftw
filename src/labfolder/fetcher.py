@@ -32,6 +32,9 @@ if not logger.handlers:
     logger.addHandler(fh)
 
 
+_DEFAULT_TIMEOUT = 30  # seconds
+
+
 class LabFolderFetcher:
     """
     High-level helper around the Labfolder API:
@@ -50,12 +53,12 @@ class LabFolderFetcher:
 
     def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         try:
-            return self._client.get(endpoint, params=params)
+            return self._client.get(endpoint, params=params)  # type: ignore[arg-type]
         except HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
                 logger.info("401 on GET %s — re-authenticating…", endpoint)
                 self._client.login()
-                return self._client.get(endpoint, params=params)
+                return self._client.get(endpoint, params=params)  # type: ignore[arg-type]
             raise
 
     def _post(self, endpoint: str, json_data: Optional[Dict[str, Any]] = None) -> requests.Response:
@@ -197,10 +200,6 @@ class LabFolderFetcher:
         preserve_entry_layout: bool = True,
         include_hidden_items: bool = False,
     ) -> str:
-        """
-        Ask Labfolder to create a PDF export for the given projects.
-        Returns the export id (we pick the newest export afterwards).
-        """
         payload = {
             "download_filename": download_filename,
             "settings": {"preserve_entry_layout": bool(preserve_entry_layout)},
@@ -234,10 +233,6 @@ class LabFolderFetcher:
         return resp.json()
 
     def wait_for_pdf_export(self, export_id: str, poll_seconds: int = 3, timeout: int = 1800) -> None:
-        """
-        Poll a PDF export until it is FINISHED or ERROR.
-        If it fails, raise with the most useful details Labfolder returns.
-        """
         deadline = time.time() + timeout
         last_status = ""
         while time.time() < deadline:
@@ -251,7 +246,6 @@ class LabFolderFetcher:
             if status == "FINISHED":
                 return
             if status in {"ERROR", "REMOVED", "ABORT_PARALLEL"}:
-                # Surface any error-like fields we can find
                 details = {k: v for k, v in info.items()
                            if k in ("error", "errorMessage", "message", "statusMessage", "download_filename") and v}
                 raise RuntimeError(f"PDF export {export_id} failed with status {status} and details {details}")
@@ -261,15 +255,12 @@ class LabFolderFetcher:
         raise TimeoutError(f"Timed out waiting for PDF export {export_id}")
 
     def download_pdf_export(self, export_id: str, dest_path: Path) -> Path:
-        """
-        Download a FINISHED PDF export to dest_path.
-        """
         url = f"{self.base_url}/exports/pdf/{export_id}/download"
-        resp = self._client._session.get(url, stream=True, allow_redirects=True)  # type: ignore[attr-defined]
+        resp = self._client._session.get(url, stream=True, allow_redirects=True, timeout=_DEFAULT_TIMEOUT)  # type: ignore[attr-defined]
         if resp.status_code == 401:
             logger.info("401 on PDF download — re-authenticating…")
             self._client.login()
-            resp = self._client._session.get(url, stream=True, allow_redirects=True)  # type: ignore[attr-defined]
+            resp = self._client._session.get(url, stream=True, allow_redirects=True, timeout=_DEFAULT_TIMEOUT)  # type: ignore[attr-defined]
         resp.raise_for_status()
         return self._stream_to_file(resp, dest_path, desc="Project PDF")
 
@@ -325,16 +316,15 @@ class LabFolderFetcher:
 
     def download_xhtml_export(self, export_id: str, dest_zip: Path) -> Path:
         url = f"{self.base_url}/exports/xhtml/{export_id}/download"
-        resp = self._client._session.get(url, stream=True, allow_redirects=True)  # type: ignore[attr-defined]
+        resp = self._client._session.get(url, stream=True, allow_redirects=True, timeout=_DEFAULT_TIMEOUT)  # type: ignore[attr-defined]
         if resp.status_code == 401:
             logger.info("401 on XHTML download — re-authenticating…")
             self._client.login()
-            resp = self._client._session.get(url, stream=True, allow_redirects=True)  # type: ignore[attr-defined]
+            resp = self._client._session.get(url, stream=True, allow_redirects=True, timeout=_DEFAULT_TIMEOUT)  # type: ignore[attr-defined]
         resp.raise_for_status()
 
         self._stream_to_file(resp, dest_zip, desc="XHTML (ZIP)")
 
-        # Validate ZIP integrity early
         if not zipfile.is_zipfile(dest_zip):
             ct = resp.headers.get("Content-Type", "")
             size = dest_zip.stat().st_size if dest_zip.exists() else 0
@@ -347,9 +337,6 @@ class LabFolderFetcher:
         return dest_zip
 
     def extract_zip(self, zip_path: Path, out_dir: Path) -> Path:
-        """
-        Extract a valid ZIP to out_dir.
-        """
         if not zipfile.is_zipfile(zip_path):
             raise RuntimeError(f"Not a valid ZIP: {zip_path}")
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -362,10 +349,6 @@ class LabFolderFetcher:
     # -------------------------------------------------------------------------
 
     def _stream_to_file(self, resp: requests.Response, dest_path: Path, *, desc: str) -> Optional[Path]:
-        """
-        Stream an HTTP response body to disk with an optional progress bar.
-        Returns the destination path, or None on error.
-        """
         total = None
         try:
             total_hdr = resp.headers.get("Content-Length")
@@ -377,7 +360,6 @@ class LabFolderFetcher:
 
         try:
             if tqdm and hasattr(tqdm, "__call__"):
-                # Show progress bar only when stdout is a TTY
                 import sys as _sys
                 use_bar = _sys.stdout.isatty()
             else:

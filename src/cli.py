@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 import http.client as http_client
-from src.core.coordinator import Coordinator
+from .core.coordinator import Coordinator
 
 SENSITIVE_KEYS = {"password", "username"}
 
@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Import Labfolder projects into eLabFTW")
     p.add_argument("-u", "--username", required=True, help="Labfolder username")
     p.add_argument("-p", "--password", required=True, help="Labfolder password")
-    p.add_argument("--url", default="https://labfolder.labforward.app/api/v2",
+    p.add_argument("--url", default="https://eln.labfolder.com/api/v2",
                    help="Labfolder API URL")
     p.add_argument("-a", "--author", dest="authors", action="append",
                    help="Author first name to include (repeatable). Example: -a Emma -a James")

@@ -1,5 +1,7 @@
 import json
 import mimetypes
+import time
+import httpx
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Iterable
 
@@ -105,20 +107,53 @@ class Importer:
 
         ep.patch(endpoint_id=exp_id, data=payload)
 
-    def upload_file(self, exp_id: str, file_path: Path) -> None:
+
+    def upload_file(
+        self,
+        exp_id: str,
+        file_path: Path,
+        *,
+        max_retries: int = 3,
+        timeout: float = 120.0,
+    ) -> None:
+        """Attach a file to an eLabFTW experiment, retrying on network errors."""
         if not exp_id.isdigit():
             raise ValueError(f"Invalid experiment ID for upload: {exp_id!r}")
 
+        # Determine MIME type
         mime_type, _ = mimetypes.guess_type(file_path.as_posix())
         mime_type = mime_type or "application/octet-stream"
 
+        # Open file once outside the retry loop
         with file_path.open("rb") as f:
             files = {"file": (file_path.name, f, mime_type)}
-            get_fixed("experiments").post(
-                endpoint_id=exp_id,
-                sub_endpoint_name="uploads",
-                files=files,
-            )
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    # Forward `timeout` and a Connection: close header to httpx
+                    get_fixed("experiments").post(
+                        endpoint_id=exp_id,
+                        sub_endpoint_name="uploads",
+                        files=files,
+                        headers={"Connection": "close"},
+                        timeout=timeout,
+                    )
+                    return  # Success: exit the method
+                except httpx.TimeoutException as err:
+                    # Timeout: retry unless we’re out of attempts
+                    if attempt == max_retries:
+                        raise RuntimeError(
+                            f"Upload timed out after {max_retries} attempts"
+                        ) from err
+                    time.sleep(5)
+                except httpx.TransportError as err:
+                    # Network/SSL/TLS errors: retry similarly
+                    if attempt == max_retries:
+                        raise RuntimeError(
+                            f"Upload failed due to transport error after "
+                            f"{max_retries} attempts"
+                        ) from err
+                    time.sleep(5)
 
     def link_resource(self, exp_id: str, resource_id: str) -> None:
         if not exp_id.isdigit():
